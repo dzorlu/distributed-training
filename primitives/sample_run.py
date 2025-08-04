@@ -210,6 +210,142 @@ def example_reduce_scatter():
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    # input_tensors is [[num_rank], ..] of length world_size.
+    input_tensor = [
+        torch.tensor([(rank + 1) * i for i in range(1, world_size+1)], dtype=torch.float32).cuda()**(j+1) 
+        for j in range(world_size)
+        ]
+    output_tensor = torch.zeros(world_size, dtype=torch.float32).cuda()
+    print(f"Before ReduceScatter on rank {rank}: {input_tensor}")
+    dist.reduce_scatter(output_tensor, input_tensor, op=dist.ReduceOp.SUM)
+    print(f"After ReduceScatter on rank {rank}: {output_tensor}")    
+
+
+def example_all_reduce_decomposition():
+    """
+    ALL_REDUCE DECOMPOSITION: Showing all_reduce = reduce_scatter + all_gather
+    
+    This demonstrates how Ring AllReduce works under the hood:
+    1. reduce_scatter: Each GPU gets one chunk of the final summed result
+    2. all_gather: Everyone shares their chunks to get complete result
+    
+    This is exactly how FSDP2 and modern frameworks implement all_reduce!
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Each GPU starts with different tensor values
+    # GPU 0: [1, 2, 3], GPU 1: [10, 20, 30], GPU 2: [100, 200, 300]
+    tensor = torch.tensor([
+        (rank + 1) * 1,  # position 0: 1, 10, 100
+        (rank + 1) * 2,  # position 1: 2, 20, 200  
+        (rank + 1) * 3   # position 2: 3, 30, 300
+    ], dtype=torch.float32).cuda()
+    
+    print(f"INITIAL STATE - GPU {rank}: {tensor}")
+    
+    # ============================================================================
+    # STEP 1: REDUCE_SCATTER 
+    # Each GPU contributes its tensor, gets back one chunk of summed result
+    # ============================================================================
+    
+    # Create input list: each position will be summed and sent to corresponding rank
+    input_list = [tensor.clone() for _ in range(world_size)]
+    output_chunk = torch.zeros(1, dtype=torch.float32).cuda()  # Single element output
+    
+    print(f"REDUCE_SCATTER INPUT - GPU {rank}: {input_list}")
+    
+    # Reduce-scatter: sum across all GPUs, each gets one chunk
+    dist.reduce_scatter(output_chunk, input_list, op=dist.ReduceOp.SUM)
+    
+    print(f"AFTER REDUCE_SCATTER - GPU {rank}: {output_chunk}")
+    print(f"  → GPU 0 has: sum of position 0 = 1+10+100 = {111 if rank == 0 else '...'}")
+    print(f"  → GPU 1 has: sum of position 1 = 2+20+200 = {222 if rank == 1 else '...'}")  
+    print(f"  → GPU 2 has: sum of position 2 = 3+30+300 = {333 if rank == 2 else '...'}")
+    
+    # ============================================================================
+    # STEP 2: ALL_GATHER
+    # Each GPU shares its chunk so everyone gets the complete result
+    # ============================================================================
+    
+    # Prepare containers to receive chunks from all GPUs
+    gather_list = [torch.zeros(1, dtype=torch.float32).cuda() for _ in range(world_size)]
+    
+    # All-gather: everyone shares their chunk
+    dist.all_gather(gather_list, output_chunk)
+    
+    # Reconstruct the complete result
+    final_result = torch.cat(gather_list)
+    
+    print(f"AFTER ALL_GATHER - GPU {rank}: {final_result}")
+    print(f"  → All GPUs now have: [111, 222, 333] (complete summed result)")
+    
+    # ============================================================================
+    # VERIFICATION: Compare with direct all_reduce
+    # ============================================================================
+    
+    # Reset tensor to original values
+    verification_tensor = torch.tensor([
+        (rank + 1) * 1, (rank + 1) * 2, (rank + 1) * 3
+    ], dtype=torch.float32).cuda()
+    
+    # Direct all_reduce for comparison
+    dist.all_reduce(verification_tensor, op=dist.ReduceOp.SUM)
+    
+    print(f"DIRECT ALL_REDUCE - GPU {rank}: {verification_tensor}")
+    print(f"  → Should match all_gather result: {torch.equal(final_result, verification_tensor)}")
+    
+    # ============================================================================
+    # SUMMARY OF TENSOR STATES
+    # ============================================================================
+    if rank == 0:
+        print("\n" + "="*80)
+        print("TENSOR STATE SUMMARY:")
+        print("="*80)
+        print("INITIAL:")
+        print("  GPU 0: [1, 2, 3]")
+        print("  GPU 1: [10, 20, 30]") 
+        print("  GPU 2: [100, 200, 300]")
+        print()
+        print("AFTER REDUCE_SCATTER:")
+        print("  GPU 0: [111]     ← sum of position 0 from all GPUs")
+        print("  GPU 1: [222]     ← sum of position 1 from all GPUs")
+        print("  GPU 2: [333]     ← sum of position 2 from all GPUs")
+        print()
+        print("AFTER ALL_GATHER:")
+        print("  GPU 0: [111, 222, 333]  ← complete result")
+        print("  GPU 1: [111, 222, 333]  ← complete result") 
+        print("  GPU 2: [111, 222, 333]  ← complete result")
+        print()
+        print("This is EXACTLY what all_reduce produces!")
+        print("Ring AllReduce = reduce_scatter + all_gather")
+        print("="*80)
+    """
+    REDUCE_SCATTER: Combines reduction + scatter in one operation
+    
+    Pattern: Multiple lists → Each rank gets one reduced chunk
+    Real-world use case:
+    - **PRIMARY**: FSDP2 gradient aggregation after backward pass
+    - After all-gather for forward/backward, each GPU has full gradients
+    - Reduce-scatter: sum gradients + re-shard them for memory efficiency
+    - Each GPU gets aggregated gradients only for its owned parameter shard
+    - Enables memory-efficient optimizer updates with sharded parameters
+    
+    This is the "Reduce-Scatter" phase of Ring AllReduce!
+    
+    Key insight: Each rank provides a LIST of tensors (length = world_size)
+    - Position i in each list gets summed and sent to rank i
+    - More memory efficient than all_reduce when you only need part of result
+    
+    Example FSDP2 workflow:
+    # After backward: each GPU has full gradients for current layer
+    # GPU 0,1,2: grad_weight[0:4096, 0:4096] (full gradient tensor)
+    reduce_scatter(my_grad_shard, [grad_weight], op=SUM)
+    # Result: GPU 0 gets grad[0:1365,:], GPU 1 gets grad[1365:2730,:], etc.
+    # Update: my_weight_shard -= lr * my_grad_shard (memory efficient!)
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     
     # Each rank creates a list of tensors - one for each destination rank
     # The tensor at position j will be reduced and sent to rank j

@@ -118,3 +118,4 @@ def zero3_training_step(model, batch, optimizer):
    - **ZeRO-3**: No final all_gather - parameters stay sharded, will be gathered again when needed
 
 5. **Memory vs Communication Trade-off**: More sharding = less memory but more frequent parameter reconstruction
+

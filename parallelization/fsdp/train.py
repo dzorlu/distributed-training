@@ -7,6 +7,10 @@ from model import ModelArgs, Transformer
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from utils import inspect_mixed_precision, inspect_model
 
+# Import the ray and profiler decorators
+from parallelization import ray, profiler
+from parallelization.profiler.decorator import step_profiler
+
 
 def set_modules_to_forward_prefetch(model, num_to_forward_prefetch):
     for i, layer in enumerate(model.layers):
@@ -85,6 +89,9 @@ def main(args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
         optim.zero_grad()
+        
+        # Step the profiler if profiling is enabled
+        step_profiler()
 
     checkpointer.save(model, optim)
     torch.distributed.destroy_process_group()
@@ -95,5 +102,20 @@ if __name__ == "__main__":
     parser.add_argument("--explicit-prefetching", action="store_true", default=False)
     parser.add_argument("--mixed-precision", action="store_true", default=False)
     parser.add_argument("--dcp-api", action="store_true", default=False)
+    parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
+    parser.add_argument("--gpus-per-node", type=int, default=1, help="Number of GPUs per node")
+    
+    # Profiler arguments
+    parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
     args = parser.parse_args()
-    main(args)
+    
+    # Apply decorators dynamically based on CLI args
+    training_func = main
+    
+    # Apply profiler decorator if requested
+    if args.profile:
+        training_func = profiler(enabled=True)(training_func)
+    
+    # Apply ray decorator for distributed training
+    distributed_main = ray(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
+    distributed_main(args)
