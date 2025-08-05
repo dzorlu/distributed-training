@@ -1,5 +1,5 @@
 import torch
-from model import Transformer
+from .model import Transformer
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Shard
 

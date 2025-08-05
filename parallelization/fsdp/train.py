@@ -1,15 +1,18 @@
 import argparse
 import os
+import time
 
 import torch
-from checkpoint import Checkpointer
-from model import ModelArgs, Transformer
+from .checkpoint import Checkpointer
+from .model import ModelArgs, Transformer
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from utils import inspect_mixed_precision, inspect_model
+from .utils import inspect_mixed_precision, inspect_model
+
 
 # Import the ray and profiler decorators
-from parallelization import ray, profiler
+from parallelization import ray, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
+
 
 
 def set_modules_to_forward_prefetch(model, num_to_forward_prefetch):
@@ -42,11 +45,12 @@ def main(args):
     batch_size = 32
     seq_len = 64
     model_args = ModelArgs(
-        n_layers=10,
-        n_heads=4,
+        n_layers=12,
+        n_heads=8, 
         vocab_size=vocab_size,
         max_seq_len=seq_len,
         dropout_p=0,
+        dim=4096,
     )
     with torch.device("meta"):
         model = Transformer(model_args)
@@ -59,6 +63,17 @@ def main(args):
     for layer in model.layers:
         fully_shard(layer, **fsdp_kwargs)
     fully_shard(model, **fsdp_kwargs)
+
+    # Log model parameter count
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    param_size_mb = total_params * 4 / (1024 * 1024)  # Assuming float32, 4 bytes per param
+    
+    print(f"📊 Model Statistics:")
+    print(f"   🔢 Total parameters: {total_params:,}")
+    print(f"   🎯 Trainable parameters: {trainable_params:,}")
+    print(f"   💾 Model size: {param_size_mb:.2f} MB")
+    print(f"   🧮 Model config: dim={model_args.dim}, layers={model_args.n_layers}, heads={model_args.n_heads}")
 
     inspect_model(model)
 
@@ -80,12 +95,19 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
-    for _ in range(10):
+
+    @flop_counter(model, enabled=args.profile, step_to_measure=1)
+    def training_step(x, step_num=None):
+        loss = model(x).sum()
+        loss.backward()
+        return loss
+
+
+    for i in range(100):
         if args.explicit_prefetching:
             model.unshard()
         x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-        loss = model(x).sum()
-        loss.backward()
+        loss = training_step(x, step_num=i)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
         optim.zero_grad()
