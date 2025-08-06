@@ -17,4 +17,6 @@ rsync -Pavz sky-26ca-dzorlu:/tmp/memory_snapshot_rank0_step6.pkl logs/
 ```
 
 
+https://ui.perfetto.dev/#!/viewer?local_cache_key=00000000-0000-0000-e413-45c54e05d0d3
+https://docs.pytorch.org/memory_viz
 
