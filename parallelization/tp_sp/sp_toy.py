@@ -1,13 +1,15 @@
 
 import os
 import sys
+from parallelization import dtensor
 import torch
 import torch.nn as nn
 import logging
 
-from torch.distributed._tensor import Shard, DTensor
+from torch.distributed.tensor import Shard, DTensor
+import torch.distributed as dist
 
-from torch.distributed._tensor.device_mesh import init_device_mesh
+from torch.distributed.tensor.device_mesh import init_device_mesh
 
 from torch.distributed.tensor.parallel import (
     parallelize_module,
@@ -122,18 +124,26 @@ class ToyModel(nn.Module):
 
         print(f"[{self.rank}] {x.shape} before in_proj - {get_placement(x)}")
         x = self.in_proj(x)
-        print(f"[{self.rank}] {x.shape} before relu" - {get_placement(x)}")
+        print(f"[{self.rank}] {x.shape} before relu - {get_placement(x)}")
         x = self.relu(x)
-        print(f"[{self.rank}] {x.shape} before out_proj" - {get_placement(x)}")
+        print(f"[{self.rank}] {x.shape} before out_proj  - {get_placement(x)}")
         out = self.out_proj(x)
-        print(f"[{self.rank}] {out.shape} before out_proj" - {get_placement(out)}")
+        print(f"[{self.rank}] {out.shape} after out_proj - {get_placement(out)}")
         return out
 
 
 if __name__ == "__main__":
+    print(torch.__version__)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)   # set by torchrun
+    device = torch.device("cuda", local_rank)           # pin this process to its GPU
+
     _world_size = int(os.environ["WORLD_SIZE"])
     device_type = torch.accelerator.current_accelerator().type
-    device_mesh = init_device_mesh(device_type=device_type, mesh_shape=(_world_size,))
+
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+    device_mesh = init_device_mesh("cuda", (_world_size,))
 
     _rank = device_mesh.get_rank()
     print(f"Starting PyTorch Sequence Parallel example on rank {_rank}.")
@@ -145,9 +155,10 @@ if __name__ == "__main__":
         in_features=in_features, 
         out_features=out_features,
         rank = _rank
-    ).to(device_type)
+    ).to(device)
 
     # Custom parallelization plan for the model
+    print("parallelizing module..")
     sp_model = parallelize_module(
         module=model,
         device_mesh=device_mesh,
@@ -188,7 +199,8 @@ if __name__ == "__main__":
 
     # Create a optimizer for the parallelized module.
     lr = 0.25
-    optimizer = torch.optim.AdamW(sp_model.parameters(), lr=lr, foreach=True)
+    #optimizer = torch.optim.AdamW(sp_model.parameters(), lr=lr, foreach=True)
+    print("optimizer initialized")
 
 
     # Perform a num of iterations of forward/backward
@@ -200,7 +212,12 @@ if __name__ == "__main__":
         # This, in addition to `ColwiseParallel(input_layouts=Shard(1))` 
         # simulates SP->TP region, where the input is sharded along the dimension 1. 
         # Input is [32, 512, in_features]
-        inp = torch.rand(32, 512, in_features,  device=device_type)
-        output = sp_model(inp)
+
+        # Create input as a DTensor with Shard(1) placement
+        # Create local shard and convert to DTensor
+        inp_local = torch.rand(32, 512 // device_mesh.size(), 256).to(device)  # Don't forget to move to device
+        
+        output = sp_model(inp_local)
+        print("step complete..")
         output.sum().backward()
-        optimizer.step()
+        #optimizer.step()

@@ -12,7 +12,8 @@ resources:
     A10: *gpu_count
     A100: *gpu_count
     A40: *gpu_count
-  image_id: docker:hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0
+  #image_id: docker:hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0
+  image_id: docker:pytorch/pytorch:2.8.0-cuda12.6-cudnn9-devel
 
 num_nodes: 1
 
