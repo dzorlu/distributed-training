@@ -1,3 +1,3 @@
-from .decorator import ray
+from .decorator import ray_distributed
 
-__all__ = ["ray"] 
+__all__ = ["ray_distributed"] 

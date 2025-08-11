@@ -37,6 +37,13 @@ Communication pattern (excluding MLP layer for simplicity)
 ```
 Weight grad in backward computation is local. So need to gather weights to flow the gradient back.
 
+
+```
+# ColwiseParallel backward: each GPU has W_local[:, :h/tp]
+dx_partial = dY @ W_local.T  # Only partial gradient!
+dx_full = all_reduce(dx_partial)  # Need to sum partials from all GPUs
+```
+
 Tensor parallelismalso does help reduce activation memory for the matrix multiplications since the intermediate activations are sharded across GPUs.
 
 Yet, ops like `LayerNorm`, `RMSNorm`, `Dropout` require full `h` for each step in thesequence. Further, `AR` is a bottleneck - the program needs to wait for all GPUs to proceed after `o` projection. `sequence parallelism` comes to help.
@@ -87,6 +94,8 @@ With `sequence parallelism`, you replace the `all-reduce` operation at the of th
 https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=sequence_parallelism
 
 Taking MLP layer into account as well, in the forward pass with vanilla TP we had two **all-reduce** operations per transformer block, and in SP we have two **all-gather** and two **reduce-scatter** operations per transformer block. So, SP does twice the number of communication operations as TP. But since an all-reduce operation can be broken down into an all-gather and a reduce-scatter , they’re actually equivalent in terms of communication cost.
+
+But in the backward pass, `TP+SP` is more favorable. In `TP only`, we need to do all-reduce on all weights to do backprop, but this operation is delayed until `SP-TP` border and done through 
 
 For Q,K,V layers, `all-reduce` step in backward computation is replaces with `reduces-scatter` during the `SP->TP` transition. Specifically;
 

@@ -8,15 +8,25 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import Shard, DTensor
+
+def debug_dtensor(tensor, name):
+    if isinstance(tensor, DTensor):
+        print(f"{name}:")
+        print(f"  Local shape: {tensor.shape}")
+        print(f"  Placements: {tensor.placements}")
+        print(f"  Device mesh: {tensor.device_mesh}")
+    else:
+        print(f"{name}: Regular tensor {tensor.shape}")
 
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
+    dim: int = 2048
+    n_layers: int = 24
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = -1  # defined later by tokenizer
+    vocab_size: int = 1000  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
@@ -206,12 +216,11 @@ class Attention(nn.Module):
         """
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis) # freqs_cis is [**256,32]
 
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -441,6 +450,7 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
+
 
         for layer in self.layers:
             h = layer(h, freqs_cis)

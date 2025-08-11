@@ -10,7 +10,7 @@ from .utils import inspect_mixed_precision, inspect_model
 
 
 # Import the ray and profiler decorators
-from parallelization import ray, profiler, flop_counter
+from parallelization import ray_distributed, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
 
 
@@ -139,5 +139,5 @@ if __name__ == "__main__":
         training_func = profiler(enabled=True)(training_func)
     
     # Apply ray decorator for distributed training
-    distributed_main = ray(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
+    distributed_main = ray_distributed(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
     distributed_main(args)

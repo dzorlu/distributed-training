@@ -50,8 +50,29 @@ file_mounts:
     mode: COPY
     persistent: True
 
+# setup: |
+#   apt update && apt install -y git tmux htop iperf3 netcat-openbsd
+
 setup: |
-  apt update && apt install -y git tmux htop iperf3 netcat-openbsd
+  set -euxo pipefail
+  apt-get update && apt-get install -y --no-install-recommends \
+      git tmux htop iperf3 netcat-openbsd && \
+      rm -rf /var/lib/apt/lists/*
+
+  python -m pip install -U pip
+  # Official Ray install w/ ML extras
+  python -m pip install -U "ray[data,train,tune,serve]"    # Ray docs recommend this for ML. 
+  # (Optional) common deps you may want anyway:
+  # python -m pip install -U tensorboard rich
+
+  # Persist envs for interactive shells
+  {
+    echo 'export PATH="/usr/local/bin:/usr/bin:$PATH"'
+    echo 'export WANDB_API_KEY='"$WANDB_API_KEY"
+    echo 'export VLLM_USE_V1=1'
+    echo 'export TORCH_NCCL_ASYNC_ERROR_HANDLING=1'
+    echo 'export NCCL_DEBUG=INFO'
+  } >> ~/.bashrc
 
 run: |
 
