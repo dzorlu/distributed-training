@@ -94,7 +94,7 @@ def main(args):
 
         # Both are now DTensors with consistent global shapes!
         "layers.*.attention": PrepareModuleInput(
-            input_layouts=(Shard(1), Replicate()),  # norm output is Shard(1), freqs_cis is local
+            input_layouts=(Shard(1), Replicate()),  # norm output is Shard(1), freqs_cis is 
             desired_input_layouts=(Replicate(), Replicate()),  # wq/wk/wv need Replicate() - ALL-GATHER here
         ),
 

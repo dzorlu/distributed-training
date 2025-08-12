@@ -130,153 +130,131 @@ Embeddings: [4, 512, 768]           # Complete embeddings
 ### With Sequence Parallelism
 
 ```python
-tp_plan = {
-    # === Embeddings ===
-    # Transferring lower payload embedding dimension (vs ~40k dimensional payload)
-    "tok_embeddings": RowwiseParallel(
-        # Token-ids are replicated in each GPU!
-        input_layouts=Replicate(),
-        # The token embeddings output Shard(1) to maintain consistent input format for all transformer layers.
-        # Now EVERY transformer block receives the same format. 
-        # the first operation in transformer block is `attention_norm` op which is SP.
-        output_layouts=Shard(1),
-    ),
-    
-    # === For each TransformerBlock (order follows forward pass) ===
-    
-    # 1. First operation: self.attention_norm(x)
-    "attention_norm": SequenceParallel(),  # Expects Shard(1), outputs Shard(1)
-    
-    # 2. Attention module needs input redistribution
-    "attention": PrepareModuleInput(
-        input_layouts=(Shard(1), None),  # norm output is Shard(1), freqs_cis is local
-        desired_input_layouts=(Replicate(), None),  # wq/wk/wv need Replicate() - ALL-GATHER here
-    ),
-    
-    # Attention layers  
-    # Unlike a regular tensor, a DTensor is aware of the parallelism plans and 
-    # will automatically handle changes in the num_heads dimension.
-    # The use_local_output=False ensures you get tensors with **global shapes**, 
-    # making view operations work correctly without manual num_heads adjustment.
-    "attention.wq": ColwiseParallel(use_local_output=False),
-    "attention.wk": ColwiseParallel(use_local_output=False),
-    "attention.wv": ColwiseParallel(use_local_output=False),
-    # Reduce-scatter op here. TP -> SP
-    "attention.wo": RowwiseParallel(output_layouts=Shard(1)),
-    
-    # 3. Second operation: self.ffn_norm(h)
-    "ffn_norm": SequenceParallel(),  # Expects Shard(1), outputs Shard(1)
-    
-    # 4. FeedForward module needs input redistribution
-    "feed_forward": PrepareModuleInput(
-        input_layouts=(Shard(1),),  # From ffn_norm
-        desired_input_layouts=(Replicate(),),  # w1/w3 need Replicate() - ALL-GATHER here
-    ),
-    
-    # Feed forward layers
-    # return self.w2(F.silu(self.w1(x)) * self.w3(x))
-    "feed_forward.w1": ColwiseParallel(),
-    "feed_forward.w3": ColwiseParallel(),
-    # Reduce-scatter op here for norm operations. 
-    "feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)), 
-    
-    # === Final model operations ===
-    # Norms - all SequenceParallel
-    "norm": SequenceParallel(),  # Final norm before output
-    
-    # Final output layer
-    "output": ColwiseParallel(
-        input_layouts=Shard(1),  # From final norm (needs to be specified!)
-        # so that we don't have to fetch from other ranks. 
-        # it is replicated in each GPU
-        # for loss calculation
-        output_layouts=Replicate()
-    ),
-}
+   tp_plan = {
+        # === Embeddings ===
+        # Transferring lower payload embedding dimension (vs ~40k dimensional payload)
+        "tok_embeddings": RowwiseParallel(
+            # Token-ids are replicated in each GPU!
+            input_layouts=Replicate(),
+            # The token embeddings output Shard(1) to maintain consistent input format for all transformer layers.
+            # Now EVERY transformer block receives the same format. 
+            # the first operation in transformer block is `attention_norm` op which is SP.
+            output_layouts=Shard(1),
+        ),
+        
+        # === For each TransformerBlock (order follows forward pass) ===
+        
+
+
+        # 1. First operation: self.attention_norm(x)
+        "layers.*.attention_norm": SequenceParallel(),  # Expects Shard(1), outputs Shard(1)
+
+        # 2. Attention module needs input redistribution
+        # PrepareModuleInput sees:
+        # - Arg 1: DTensor [32, 128, 2048] with Shard(1)
+        # - Arg 2: Convert to DTensor [256, 32] with Replicate()
+
+        # After redistribution:
+        # - Arg 1: DTensor [32, 256, 2048] with Replicate() 
+        # - Arg 2: DTensor [256, 32] with Replicate()
+
+        # Both are now DTensors with consistent global shapes!
+        "layers.*.attention": PrepareModuleInput(
+            input_layouts=(Shard(1), Replicate()),  # norm output is Shard(1), freqs_cis is 
+            desired_input_layouts=(Replicate(), Replicate()),  # wq/wk/wv need Replicate() - ALL-GATHER here
+        ),
+
+
+
+        # Attention layers  
+        # Unlike a regular tensor, a DTensor is aware of the parallelism plans and 
+        # will automatically handle changes in the num_heads dimension.
+        # The use_local_output=False ensures you get tensors with **global shapes**, 
+        # making view operations work correctly without manual num_heads adjustment.
+        "layers.*.attention.wq": ColwiseParallel(use_local_output=False),
+        "layers.*.attention.wk": ColwiseParallel(use_local_output=False),
+        "layers.*.attention.wv": ColwiseParallel(use_local_output=False),
+        # Reduce-scatter op here. TP -> SP
+        "layers.*.attention.wo": RowwiseParallel(output_layouts=Shard(1)),
+        
+        # 3. Second operation: self.ffn_norm(h)
+        "layers.*.ffn_norm": SequenceParallel(),  # Expects Shard(1), outputs Shard(1)
+        
+        # 4. FeedForward module needs input redistribution
+        "layers.*.feed_forward": PrepareModuleInput(
+            input_layouts=(Shard(1),),  # From ffn_norm
+            desired_input_layouts=(Replicate(),),  # w1/w3 need Replicate() - ALL-GATHER here
+        ),
+        
+        # Feed forward layers
+        # return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        "layers.*.feed_forward.w1": ColwiseParallel(),
+        "layers.*.feed_forward.w3": ColwiseParallel(),
+        # Reduce-scatter op here for norm operations for next layer.
+        "layers.*.feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)), 
+        
+        # === Final model operations ===
+        # Norms - all SequenceParallel
+        "norm": SequenceParallel(),  # Final norm before output
+        
+        # Final output layer
+        "output": ColwiseParallel(
+            input_layouts=Shard(1),  # From final norm (needs to be specified!)
+            # so that we don't have to fetch from other ranks. 
+            # it is replicated in each GPU
+            # for loss calculation
+            output_layouts=Replicate()
+        ),
+    }
 ```
 
 ## Data Flow Through Transformer
 
 ```python
-## Data Flow Through Transformer (2 Ranks)
+Data Flow Through Transformer (2 Ranks)
 
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Operation            | Input Tensor   | Input       | Weight Shape & Sharding   | Communication  | Output Tensor  | Output      |
-|                      |                | Layout      |                           |                |                | Layout      |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Token IDs            | [4, 512]       | Replicate() | -                         | -              | [4, 512]       | Replicate() |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| tok_embeddings       | [4, 512]       | Replicate() | [32000, 768]              | All-reduce +   | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Rank 0: [16000, 768]      | Redistribute   |                |             |
-|                      |                |             | Rank 1: [16000, 768]      |                |                |             |
-|                      |                |             | Shard(0) on vocab         |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| attention_norm       | [4, 256, 768]  | Shard(1)    | [768] weights             | None           | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Replicate()               |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| PrepareModuleInput   | [4, 256, 768]  | Shard(1)    | -                         | All-gather     | [4, 512, 768]  | Replicate() |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| attention.wq         | [4, 512, 768]  | Replicate() | [768, 768]                | None           | [4, 512, 384]  | Shard(-1)   |
-|                      |                |             | Rank 0: [384, 768]        |                |                |             |
-|                      |                |             | Rank 1: [384, 768]        |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| attention.wk         | [4, 512, 768]  | Replicate() | [768, 768]                | None           | [4, 512, 384]  | Shard(-1)   |
-|                      |                |             | Per rank: [384, 768]      |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| attention.wv         | [4, 512, 768]  | Replicate() | [768, 768]                | None           | [4, 512, 384]  | Shard(-1)   |
-|                      |                |             | Per rank: [384, 768]      |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Attention compute    | [4, 512, 384]  | Shard(-1)   | -                         | All-to-all     | [4, 512, 768]  | Shard(-1)   |
-|                      |                |             |                           | (heads)        |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| attention.wo         | [4, 512, 768]  | Shard(-1)   | [768, 768]                | Reduce-scatter | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Rank 0: [768, 384]        |                |                |             |
-|                      |                |             | Rank 1: [768, 384]        |                |                |             |
-|                      |                |             | Shard(1) on in            |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Residual add         | [4, 256, 768]  | Shard(1)    | -                         | None           | [4, 256, 768]  | Shard(1)    |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| ffn_norm             | [4, 256, 768]  | Shard(1)    | [768] weights             | None           | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Replicate()               |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| PrepareModuleInput   | [4, 256, 768]  | Shard(1)    | -                         | All-gather     | [4, 512, 768]  | Replicate() |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| feed_forward.w1      | [4, 512, 768]  | Replicate() | [768, 3072]               | None           | [4, 512, 1536] | Shard(-1)   |
-|                      |                |             | Rank 0: [1536, 768]       |                |                |             |
-|                      |                |             | Rank 1: [1536, 768]       |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| feed_forward.w3      | [4, 512, 768]  | Replicate() | [768, 3072]               | None           | [4, 512, 1536] | Shard(-1)   |
-|                      |                |             | Per rank: [1536, 768]     |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| SiLU(w1) * w3        | [4, 512, 1536] | Shard(-1)   | -                         | None           | [4, 512, 1536] | Shard(-1)   |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| feed_forward.w2      | [4, 512, 1536] | Shard(-1)   | [3072, 768]               | Reduce-scatter | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Rank 0: [768, 1536]       |                |                |             |
-|                      |                |             | Rank 1: [768, 1536]       |                |                |             |
-|                      |                |             | Shard(1) on in            |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Residual add         | [4, 256, 768]  | Shard(1)    | -                         | None           | [4, 256, 768]  | Shard(1)    |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| (Next layer...)      | [4, 256, 768]  | Shard(1)    | -                         | -              | -              | -           |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| Final norm           | [4, 256, 768]  | Shard(1)    | [768] weights             | None           | [4, 256, 768]  | Shard(1)    |
-|                      |                |             | Replicate()               |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-| output               | [4, 256, 768]  | Shard(1)    | [768, 32000]              | All-gather     | [4, 512, 32000]| Replicate() |
-|                      |                |             | Rank 0: [16000, 768]      | (input first)  |                |             |
-|                      |                |             | Rank 1: [16000, 768]      |                |                |             |
-|                      |                |             | Shard(0) on out           |                |                |             |
-+----------------------+----------------+-------------+---------------------------+----------------+----------------+-------------+
-
-Key observations:
-- Sequence dimension alternates: 512 (replicated) ↔ 256 (sharded)
-- Feature dimension alternates: 768 (replicated) ↔ 384/1536 (sharded)
-- Only 2 major communications per transformer block: all-gather (entry) + reduce-scatter (exit)
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| Operation            | Input Tensor  | Input       | Weight Shape & Sharding | Communication        | Output Tensor | Output      |
+|                      |               | Layout      |                         | (Input→Output)       |               | Layout      |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| Token IDs            | [4, 512]      | Replicate() | -                       | -                    | [4, 512]      | Replicate() |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| tok_embeddings       | [4, 512]      | Replicate() | [32000, 768]            | 1. All-reduce        | [4, 256, 768] | Shard(1)    |
+|                      |               |             | Rank 0: [16000, 768]    |    (sum partials)    |               |             |
+|                      |               |             | Rank 1: [16000, 768]    | 2. Scatter           |               |             |
+|                      |               |             | Shard(0) on vocab       |    (to Shard(1))     |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| attention_norm       | [4, 256, 768] | Shard(1)    | [768] weights           | None                 | [4, 256, 768] | Shard(1)    |
+|                      |               |             | Replicate()             |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| PrepareModuleInput   | [4, 256, 768] | Shard(1)    | -                       | All-gather           | [4, 512, 768] | Replicate() |
+| (attention)          |               |             |                         |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| attention.wq         | [4, 512, 768] | Replicate() | [768, 768]              | None                 | [4, 512, 384] | Shard(-1)   |
+| (Linear)             |               |             | Per rank: [384, 768]    | (local matmul)       |               |             |
+|                      |               |             | Shard(0) on out         |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| attention.wk         | [4, 512, 768] | Replicate() | [768, 768]              | None                 | [4, 512, 384] | Shard(-1)   |
+| (Linear)             |               |             | Per rank: [384, 768]    | (local matmul)       |               |             |
+|                      |               |             | Shard(0) on out         |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| attention.wv         | [4, 512, 768] | Replicate() | [768, 768]              | None                 | [4, 512, 384] | Shard(-1)   |
+| (Linear)             |               |             | Per rank: [384, 768]    | (local matmul)       |               |             |
+|                      |               |             | Shard(0) on out         |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| Attention compute    | Q,K,V:        | Shard(-1)   | -                       | None                 | [4, 512, 768] | Shard(-1)   |
+| (SDPA + heads)       | [4, 512, 384] |             |                         | (local compute)      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| attention.wo         | [4, 512, 768] | Shard(-1)   | [768, 768]              | Reduce-scatter       | [4, 256, 768] | Shard(1)    |
+| (Linear)             |               |             | Per rank: [768, 384]    |                      |               |             |
+|                      |               |             | Shard(1) on in          |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| Residual add         | [4, 256, 768] | Shard(1)    | -                       | None                 | [4, 256, 768] | Shard(1)    |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| ffn_norm             | [4, 256, 768] | Shard(1)    | [768] weights           | None                 | [4, 256, 768] | Shard(1)    |
+|                      |               |             | Replicate()             |                      |               |             |
++----------------------+---------------+-------------+-------------------------+----------------------+---------------+-------------+
+| PrepareModuleInput   | [4, 256, 768] | Sh
 ```
 
 
