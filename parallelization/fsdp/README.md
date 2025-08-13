@@ -2,12 +2,20 @@
 
 ## 📊 Memory Efficiency & Communication Patterns
 
-| Stage | What's Sharded | Forward Pass | Backward Pass | Optimizer Step | Memory per GPU |
-|-------|----------------|--------------|---------------|----------------|----------------|
-| **DDP** | Nothing | No communication | `all_reduce(gradients)` | Local update | 100% |
-| **ZeRO-1** | Optimizer states only | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~75% |
-| **ZeRO-2** | Optimizer + gradients | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~50% |
-| **ZeRO-3** | Parameters + gradients + optimizer | `all_gather(parameters)` | `all_gather(parameters)` + `reduce_scatter(gradients)` | Local update (no all_gather) | ~33% |
+| Stage | What's Sharded | Forward Pass | Backward Pass | Optimizer Step | Memory per GPU | Bandwidth per Step |
+|-------|----------------|--------------|---------------|----------------|----------------|-------------------|
+| **DDP** | Nothing | No communication | `all_reduce(gradients)` | Local update | 100% | 2×params |
+| **ZeRO-1** | Optimizer states only | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~75% | 4×params |
+| **ZeRO-2** | Optimizer + gradients | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~50% | 4×params |
+| **ZeRO-3** | Parameters + gradients + optimizer | `all_gather(parameters)` | `all_gather(parameters)` + `reduce_scatter(gradients)` | Local update (no all_gather) | ~33% | 6×params per layer |
+
+## 📈 Communication Cost Analysis
+
+| Method | Sync Points | Logical Ops | Actual Bandwidth | When Efficient |
+|--------|-------------|-------------|------------------|----------------|
+| **DDP** | 1 per batch | 1×`all_reduce` | 2×params total | Always for small models |
+| **ZeRO-1/2** | 2 per batch | 1×`reduce_scatter` + 1×`all_gather` | 4×params total | Memory constrained |
+| **ZeRO-3/FSDP** | 3 per layer | 2×`all_gather` + 1×`reduce_scatter` | 6×params per layer | Large batch (B/N > 850) |
 
 ## 🔄 ZeRO-1 & ZeRO-2: Optimizer State (+ Gradient) Partitioning
 
@@ -15,10 +23,7 @@
 **ZeRO-2**: Optimizer states + gradients sharded - gradients stored in sharded form for memory savings  
 **Communication**: Identical for both (reduce_scatter more applicable for ZeRO-2 where gradients are actually sharded)
 
-Zero stage 1 is free (in the bandwith limitedregime) memory wins.
-communication cost is still 2x params (receive one and pass one) for each GPU.
-
-
+Zero stage 1 is free (in the bandwidth limited regime) memory wins. Communication cost is still 2x params (receive one and pass one) for each GPU.
 
 ```python
 # ZeRO-1/ZeRO-2 Training Step with 3 GPUs
@@ -119,3 +124,39 @@ def zero3_training_step(model, batch, optimizer):
 
 5. **Memory vs Communication Trade-off**: More sharding = less memory but more frequent parameter reconstruction
 
+6. **Bandwidth Reality Check**: 
+   ```python
+   # Bandwidth cost per collective operation (ring algorithm):
+   all_reduce:      ~2W  (NOT 4W - it's pipelined!)
+   all_gather:      ~2W
+   reduce_scatter:  ~2W
+   
+   # Total bandwidth by method:
+   DDP:       1×all_reduce = 2×params (once per batch)
+   ZeRO-1/2:  1×reduce_scatter + 1×all_gather = 4×params (once per batch)
+   ZeRO-3:    2×all_gather + 1×reduce_scatter = 6×params (per layer!)
+   ```
+
+7. **FSDP Efficiency Threshold**: FSDP becomes efficient when B/N > 850 because:
+   ```python
+   # FSDP communication cost is fixed per layer
+   fsdp_comm_time = 6 × param_size × layers / bandwidth
+   
+   # Compute time scales with batch size
+   compute_time = batch_size × compute_per_example
+   
+   # Efficiency improves with larger batches:
+   efficiency = compute_time / (compute_time + fsdp_comm_time)
+            = 1 / (1 + constant/batch_size)
+            → 1 as batch_size increases
+   ```
+
+8. **Communication Frequency**: 
+   - DDP/ZeRO-1/2 communicate once per batch (can overlap with computation)
+   - ZeRO-3 communicates 3× per layer (hard to overlap, blocking operations)
+
+9. **When to Use Each**:
+   - **DDP/ZeRO-1**: Default choice for small models
+   - **ZeRO-2**: When gradient memory is significant
+   - **ZeRO-3/FSDP**: Only when model doesn't fit AND batch size is large
+   - **Tensor Parallel**: Keep within single node due to high bandwidth needs
