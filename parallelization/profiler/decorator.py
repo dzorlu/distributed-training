@@ -31,7 +31,8 @@ def flop_counter(model, enabled=True, step_to_measure=1):
                     result = func(*args, step_num=step_num, **kwargs)
                     t_lapsed = time.time() - t
                     # TODO: (dzorlu) grab the model name from the model
-                    total_flops = sum(ftdm.flop_counts['FSDPTransformer'].values())                
+                    #total_flops = sum(ftdm.flop_counts['FSDPTransformer'].values()) 
+                    total_flops = sum(ftdm.flop_counts['Transformer'].values())                
                     tflops = total_flops / t_lapsed / 1e12
                     print(f"rank {rank} step {step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
                     return result
@@ -61,8 +62,8 @@ def trace_handler(prof):
     print(f"💾 Memory timeline (Allocated vs Reserved) saved to: {snap_path}")
 
     # # Compute total FLOPs
-    # total_flops = sum(evt.flops for evt in prof.key_averages() if hasattr(evt, "flops"))
-    # print(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}")
+    total_flops = sum(evt.flops for evt in prof.key_averages() if hasattr(evt, "flops"))
+    print(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}")
 
 
 def profiler(

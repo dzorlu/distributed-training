@@ -21,6 +21,7 @@ from torch.distributed.tensor.parallel import (
     PrepareModuleInput,
 )
 from torch.distributed.tensor import distribute_tensor, Shard, Replicate
+from torch.distributed.fsdp import fully_shard
 
 def extract_unique_param_names(model):
     """Extract unique parameter patterns without layer numbers"""
@@ -53,7 +54,20 @@ def main(args):
     print(f"device: {device}")        # pin this process to its GPU
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    device_mesh = init_device_mesh("cuda", (world_size,)) # 1D - TP.
+    tp_size = 2
+    if args.fsdp_enable:
+        dp_size = world_size // tp_size
+        device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp"))
+        tp_mesh = device_mesh["tp"]
+        # to ensure TP gets the same data.
+        dp_mesh = device_mesh["dp"]
+        dp_rank = dp_mesh.get_local_rank()
+    else:
+        tp_mesh = init_device_mesh("cuda", (world_size,)) # 1D - TP.
+    
+    
+
+
 
     model_args = ModelArgs()
     model = Transformer.from_model_args(model_args)
@@ -144,9 +158,13 @@ def main(args):
 
     model = parallelize_module(
         module=model,
-        device_mesh=device_mesh,
+        device_mesh=tp_mesh,
         parallelize_plan=tp_plan
     )
+
+    if args.fsdp_enable:
+        model = fully_shard(model, mesh=device_mesh)
+
 
     print("=== Parameter Analysis ===")
     regular_tensors = []
@@ -170,14 +188,20 @@ def main(args):
     lr = 0.25
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, foreach=True)
 
+    @flop_counter(model, enabled=args.profile, step_to_measure=1)
+    def training_step(x, step_num=None):
+        loss = model(x).sum()
+        loss.backward()
+        return loss
+
     num_iter = 10
     batch_size = 2
     seq_len = 128
     for i in range(num_iter):
-        torch.manual_seed(i)
+        # seeding with dp_rank to ensure identical inputs for TP groups
+        torch.manual_seed(i + dp_rank)
         x = torch.randint(model_args.vocab_size, (batch_size, seq_len)).to(device)
-        output = model(x)
-        output.sum().backward()
+        loss = training_step(x, step_num=i)
         optimizer.step()
 
         # Step the profiler if profiling is enabled

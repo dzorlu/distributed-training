@@ -16,6 +16,7 @@
 | **DDP** | 1 per batch | 1×`all_reduce` | 2×params total | Always for small models |
 | **ZeRO-1/2** | 2 per batch | 1×`reduce_scatter` + 1×`all_gather` | 4×params total | Memory constrained |
 | **ZeRO-3/FSDP** | 3 per layer | 2×`all_gather` + 1×`reduce_scatter` | 6×params per layer | Large batch (B/N > 850) |
+| **Tensor Parallel** | 4 per layer | 4×`all_reduce` on activations | 8×activations/layer | Within node only |
 
 ## 🔄 ZeRO-1 & ZeRO-2: Optimizer State (+ Gradient) Partitioning
 
@@ -127,9 +128,10 @@ def zero3_training_step(model, batch, optimizer):
 6. **Bandwidth Reality Check**: 
    ```python
    # Bandwidth cost per collective operation (ring algorithm):
-   all_reduce:      ~2W  (NOT 4W - it's pipelined!)
-   all_gather:      ~2W
-   reduce_scatter:  ~2W
+   # For tensor of size M:
+   all_reduce:      ~2M  (NOT 4M - it's pipelined!)
+   all_gather:      ~2M
+   reduce_scatter:  ~2M
    
    # Total bandwidth by method:
    DDP:       1×all_reduce = 2×params (once per batch)
