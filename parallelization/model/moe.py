@@ -1,0 +1,196 @@
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+import torch.nn.functional as F
+
+try:
+    from grouped_gemm import ops
+except ImportError:
+    raise RuntimeError(
+        "Grouped GEMM is not available. Please run `pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main` (takes less than 5 minutes)"
+    )
+
+
+
+@dataclass
+class MoEModelArgs:
+    hidden_dim: int
+    num_experts: int
+    top_k: int
+    dim: int
+
+class Router(nn.Module):
+    """
+    Determines which tokens are routed to which experts and reorders the token
+    data into an expert-centric layout.
+
+    This module performs three main functions:
+    1.  **Routing:** Computes scores and selects the top-k experts for each token.
+    2.  **Reordering:** Calculates the permutation needed to group all tokens
+        destined for the same expert together.
+    3.  **Gathering:** Gathers the actual token data according to the new
+        expert-centric order, preparing it for dispatch (e.g., via an
+        all-to-all communication primitive).
+
+    Args:
+        model_args (MoEModelArgs): A dataclass containing the configuration for
+            the MoE layer, including hidden_dim, num_experts, and top_k.
+    """
+    def __init__(self, model_args: MoEModelArgs):
+        super().__init__()
+        
+        self.model_args = model_args
+        self.router = nn.Linear(model_args.hidden_dim, model_args.num_experts, bias=False)
+        
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Processes an input tensor to select experts and prepare for MoE dispatch.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape `(batch_size * seq_len, hidden_dim)`.
+
+        Returns:
+            A tuple containing:
+            - torch.Tensor: `x_gathered`: The reordered token data for the experts.
+              Shape: `(batch_size * seq_len * top_k, hidden_dim)`.
+            - torch.Tensor: `num_tokens_per_expert`: The number of tokens assigned to each expert.
+              Shape: `(num_experts,)`.
+            - torch.Tensor: `scatter_indices`: The indices needed to scatter the expert outputs
+              back to their original token positions. Shape: `(batch_size * seq_len * top_k)`.
+            - torch.Tensor: `scores_sorted`: The router scores, sorted in the same
+              expert-centric order as `x_gathered`. Shape: `(batch_size * seq_len * top_k)`.
+        
+        Example Data Flow (batch=1, seq_len=4, top_k=2, num_experts=4):
+        - Input `x` shape: `(4, h)`
+        - `selected_experts_indices`: `[[0, 2], [1, 3], [0, 3], [1, 2]]`
+          (Token 0 goes to experts 0 & 2, Token 1 to 1 & 3, etc.)
+        - `token_indices_experts_sorted`: `[0, 2, 1, 3, 0, 3, 1, 2]`
+          (The reordered plan: Token 0 for E0, Token 2 for E0, Token 1 for E1, etc.)
+        - Output `x_gathered`: Contains data `[x[0], x[2], x[1], x[3], x[0], x[3], x[1], x[2]]`
+        """
+        # [b*s, h] -> [b*s, num_experts]
+        expert_scores = self.router(x)
+        
+        # [b*s, num_experts], [b*s, num_experts]
+        # [[0,2], [1,3], ..] token_A-> [0,2] etc
+        top_scores, selected_experts_indices = torch.topk(expert_scores, k=self.model_args.top_k, dim=-1)
+        top_scores = F.softmax(top_scores, dim=-1, dtype=torch.float32).type_as(x)
+        
+        # histogram!
+        # [num_experts]
+        # Example: [2.0, 2.0, 2.0, 2.0] # each expert gets 2.
+        num_tokens_per_expert = torch.histc(
+            selected_experts_indices.view(-1).float(),
+            bins=self.model_args.num_experts,
+            min=0,            
+            max=self.model_args.num_experts,
+        )
+
+        # Flattened view before sort: [0, 2, 1, 3, 0, 3, 1, 2]
+        # Meaning: [A→E0, A→E2, B→E1, B→E3, C→E0, C→E3, D→E1, D→E2]
+        flat_expert_indices = selected_experts_indices.view(-1)
+
+        # 1) After argsort indices: [0, 4, 2, 6, 1, 7, 3, 5]
+        # This reorders to: [A→E0, C→E0, B→E1, D→E1, A→E2, D→E2, B→E3, C→E3]
+        sorted_indices = torch.argsort(flat_expert_indices, stable=True)
+
+        # 2) Convert sorted indices back to token indices
+        # Result: [0, 2, 1, 3, 0, 3, 1, 2]
+        # Meaning: [TokenA, TokenC, TokenB, TokenD, TokenA, TokenD, TokenB, TokenC]
+        # This is the crucial index tensor that tells the final scatter operation
+        # which original token position each expert output corresponds to.
+        scatter_indices = sorted_indices // self.model_args.top_k
+
+        # Gather the actual token data from the token indices;
+        # now x is replicated and in order
+        # [b*s*top_k, h]
+        x_gathered = x[scatter_indices]
+        
+        # Also reorder the scores to match the new token order.
+        scores_sorted = top_scores.view(-1)[sorted_indices]
+        
+        return x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted
+
+
+class GroupedExpert(nn.Module):
+    """
+    Implements the expert computation for a Mixture of Experts (MoE) layer
+    using grouped matrix multiplication (GEMM).
+    
+    """
+    def __init__(self, model_args: MoEModelArgs):
+        super().__init__()
+        self.model_args = model_args
+        self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.hidden_dim, model_args.dim))
+        self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(model_args.num_experts, model_args.hidden_dim, model_args.dim))
+
+    def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the forward pass for all experts on a packed tensor of tokens.
+        """
+        # Move batch sizes to CPU
+        num_tokens_per_expert_cpu = num_tokens_per_expert.to("cpu").to(torch.int64)
+        
+        # Convert to bfloat16 if needed (grouped_gemm supports it)
+        x_bf16 = x.to(torch.bfloat16)
+        w1_bf16 = self.w1.to(torch.bfloat16)
+        w2_bf16 = self.w2.to(torch.bfloat16)
+        w3_bf16 = self.w3.to(torch.bfloat16)
+
+        # MLP layers with activation
+        x1 = ops.gmm(x_bf16, w1_bf16, num_tokens_per_expert_cpu, trans_b=False)
+        x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
+        h = F.silu(x1) * x3
+        out = ops.gmm(h, w2_bf16, num_tokens_per_expert_cpu, trans_b=False)
+        
+        # Convert back to original dtype
+        return out.to(x.dtype)
+
+
+class MoE(nn.Module):
+    """
+    A complete Mixture of Experts (MoE) layer that composes a Router and
+    GroupedExpert modules.
+    """
+    def __init__(self, model_args: MoEModelArgs):
+        super().__init__()
+        self.model_args = model_args
+        self.router = Router(model_args)
+        self.experts = GroupedExpert(model_args)
+
+    def forward(self, x: torch.Tensor):
+        bsz, seq, dim = x.shape
+        x_flat = x.reshape(-1, dim)
+
+        # 1. Get routing plan, gathered tokens, and scores from the router.
+        x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted = self.router(x_flat)
+        
+        # 2. Pass the gathered tokens and token counts to the experts.
+        # shape (bs*slen*top_k, dim)
+        routed_output = self.experts(x_gathered, num_tokens_per_expert)
+
+        # 3. Weight the expert outputs by their router scores.
+        weighted_routed_output = routed_output * scores_sorted.unsqueeze(1)
+
+        # 4. Scatter the weighted outputs back to their original token positions.
+        # # Accumulate values into buckets
+        # src = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+        # index = torch.tensor([0, 2, 0, 1, 2])  # which bucket for each element
+        # dst = torch.zeros(3)  # 3 buckets
+        # dst.scatter_add_(0, index, src)
+        # # Result: [4.0, 4.0, 7.0]
+        # # Bucket 0: 1.0 + 3.0 = 4.0
+        # # Bucket 1: 4.0 = 4.0  
+        # # Bucket 2: 2.0 + 5.0 = 7.0
+        out_flat = torch.zeros_like(x_flat)
+        scatter_indices_expanded = scatter_indices.unsqueeze(1).expand_as(weighted_routed_output)
+        out_flat.scatter_add_(
+            dim=0,
+            index=scatter_indices_expanded,
+            src=weighted_routed_output,
+        )
+        
+        # 5. Reshape the output back to the original input shape.
+        return out_flat.reshape(bsz, seq, dim)

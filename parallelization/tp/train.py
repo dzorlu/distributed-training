@@ -1,5 +1,5 @@
-from .llama2_model import Transformer
-from .llama2_model import ModelArgs
+from parallelization.train.llama2_model import Transformer
+from parallelization.train.llama2_model import ModelArgs
 import argparse
 import os
 import re
@@ -57,6 +57,7 @@ def main(args):
     tp_size = 2
     if args.fsdp_enable:
         dp_size = world_size // tp_size
+        print(f"{device=}, {dp_size=}, {tp_size=}")
         device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp"))
         tp_mesh = device_mesh["tp"]
         # to ensure TP gets the same data.
@@ -64,6 +65,7 @@ def main(args):
         dp_rank = dp_mesh.get_local_rank()
     else:
         tp_mesh = init_device_mesh("cuda", (world_size,)) # 1D - TP.
+        dp_rank = 0
     
     
 
@@ -72,6 +74,7 @@ def main(args):
     model_args = ModelArgs()
     model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
+    model.init_weights()
 
 
     param_names = extract_unique_param_names(model)
@@ -163,7 +166,8 @@ def main(args):
     )
 
     if args.fsdp_enable:
-        model = fully_shard(model, mesh=device_mesh)
+        # now only pass dp_mesh
+        model = fully_shard(model, mesh=dp_mesh)
 
 
     print("=== Parameter Analysis ===")
@@ -216,6 +220,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch TP/SP example")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=1, help="Number of GPUs per node")
+    parser.add_argument("--fsdp-enable", action="store_true", help="Enable FSDP with 2D parallelism")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")

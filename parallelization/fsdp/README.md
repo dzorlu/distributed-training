@@ -5,160 +5,141 @@
 | Stage | What's Sharded | Forward Pass | Backward Pass | Optimizer Step | Memory per GPU | Bandwidth per Step |
 |-------|----------------|--------------|---------------|----------------|----------------|-------------------|
 | **DDP** | Nothing | No communication | `all_reduce(gradients)` | Local update | 100% | 2×params |
-| **ZeRO-1** | Optimizer states only | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~75% | 4×params |
-| **ZeRO-2** | Optimizer + gradients | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~50% | 4×params |
-| **ZeRO-3** | Parameters + gradients + optimizer | `all_gather(parameters)` | `all_gather(parameters)` + `reduce_scatter(gradients)` | Local update (no all_gather) | ~33% | 6×params per layer |
+| **ZeRO-1** | Optimizer states only | No communication | `all_reduce(gradients)` | Local update + `all_gather(parameters)` | ~75% | 3×params |
+| **ZeRO-2** | Optimizer + gradients | No communication | `reduce_scatter(gradients)` | Local update + `all_gather(parameters)` | ~50% | 2×params |
+| **ZeRO-3** | Everything | `all_gather(parameters)` | `all_gather(parameters)` + `reduce_scatter(gradients)` | Local update (params stay sharded) | ~33% | 3×params |
 
 ## 📈 Communication Cost Analysis
 
-| Method | Sync Points | Logical Ops | Actual Bandwidth | When Efficient |
-|--------|-------------|-------------|------------------|----------------|
-| **DDP** | 1 per batch | 1×`all_reduce` | 2×params total | Always for small models |
-| **ZeRO-1/2** | 2 per batch | 1×`reduce_scatter` + 1×`all_gather` | 4×params total | Memory constrained |
-| **ZeRO-3/FSDP** | 3 per layer | 2×`all_gather` + 1×`reduce_scatter` | 6×params per layer | Large batch (B/N > 850) |
-| **Tensor Parallel** | 4 per layer | 4×`all_reduce` on activations | 8×activations/layer | Within node only |
+| Method | Communication Operations | Bandwidth Breakdown | Total Bandwidth |
+|--------|-------------------------|-------------------|-----------------|
+| **DDP** | `all_reduce(grads)` | 2P | **2×params** |
+| **ZeRO-1** | `all_reduce(grads)` + `all_gather(params)` | 2P + 1P | **3×params** |
+| **ZeRO-2** | `reduce_scatter(grads)` + `all_gather(params)` | 1P + 1P | **2×params** |
+| **ZeRO-3** | 2×`all_gather(params)` + `reduce_scatter(grads)` | 2P + 1P | **3×params** |
 
-## 🔄 ZeRO-1 & ZeRO-2: Optimizer State (+ Gradient) Partitioning
+## 🔄 ZeRO-1: Optimizer State Partitioning
 
-**ZeRO-1**: Only optimizer states sharded - gradients computed but not stored in sharded form  
-**ZeRO-2**: Optimizer states + gradients sharded - gradients stored in sharded form for memory savings  
-**Communication**: Identical for both (reduce_scatter more applicable for ZeRO-2 where gradients are actually sharded)
-
-Zero stage 1 is free (in the bandwidth limited regime) memory wins. Communication cost is still 2x params (receive one and pass one) for each GPU.
+**What's sharded**: Only Adam optimizer states (momentum, variance)  
+**What's replicated**: Parameters and gradients  
+**Key insight**: Each GPU can only update 1/N params (those it has optimizer states for)
 
 ```python
-# ZeRO-1/ZeRO-2 Training Step with 3 GPUs
-def zero1_zero2_training_step(model, batch, optimizer):
-    # === FORWARD PASS ===
-    # No communication - each GPU has full parameters
-    loss = model(batch)  # Each GPU: complete model, different batch
+# ZeRO-1 Training Step with Adam
+def zero1_training_step(model, batch):
+    # === FORWARD + BACKWARD ===
+    loss = model(batch)
+    loss.backward()
     
-    # === BACKWARD PASS ===
-    loss.backward()  # Each GPU: computes full gradients
-    
-    # === GRADIENT COMMUNICATION ===
-    # reduce_scatter: Takes gradients from all GPUs, sums them, distributes chunks
-    all_gradients = [param.grad for param in model.parameters()]
-    my_gradient_shard = torch.zeros_like(all_gradients[rank])
-    
-    # Each GPU gets averaged gradients for the parameter it owns optimizer states for
-    dist.reduce_scatter(my_gradient_shard, all_gradients, op=SUM)
-    my_gradient_shard /= world_size
+    # === GRADIENT SYNC ===
+    # all_reduce: Average gradients across all GPUs
+    # Bandwidth: 2×params
+    all_reduce(gradients)  # Every GPU now has identical full gradients
     
     # === OPTIMIZER STEP ===
-    # Each GPU updates only its owned parameter using its gradient shard
-    my_param = list(model.parameters())[rank]
-    my_param.grad = my_gradient_shard
-    optimizer.step_single_param(my_param)
+    # Each GPU updates ONLY params it has Adam states for
+    # GPU 0: updates params[0:N/4] with its momentum_0, variance_0
+    # GPU 1: updates params[N/4:N/2] with its momentum_1, variance_1
     
-    # === PARAMETER COMMUNICATION ===
-    # all_gather: Collect updated parameters from all GPUs to reconstruct full model
-    # This is REQUIRED because parameters are still replicated in ZeRO-1/2
-    updated_params = [torch.zeros_like(p) for p in model.parameters()]
-    for i, param in enumerate(model.parameters()):
-        dist.all_gather(updated_params, param.data)
-        param.data = updated_params[i]  # Everyone gets full updated model
-    
-    optimizer.zero_grad()
+    # === PARAMETER SYNC ===
+    # all_gather: Each GPU's updated params → all GPUs
+    # Bandwidth: 1×params
+    all_gather(parameters)
 
-# Memory: ZeRO-1 ~75%, ZeRO-2 ~50% of DDP
-# Communication: reduce_scatter(gradients) + all_gather(parameters)
+# Memory: Saves 2×params (Adam states) / world_size
+# Bandwidth: 2P (all_reduce) + 1P (all_gather) = 3×params
+```
+
+## 🔄 ZeRO-2: Optimizer State + Gradient Sharding
+
+**What's sharded**: Adam states AND gradients  
+**What's replicated**: Parameters only  
+**Critical insight**: Gradient shards align with optimizer state shards!
+
+```python
+# ZeRO-2 Training Step with Adam
+def zero2_training_step(model, batch):
+    # === FORWARD + BACKWARD ===
+    loss = model(batch)
+    loss.backward()
+    
+    # === GRADIENT SHARDING ===
+    # reduce_scatter: Sum gradients and shard them
+    # Bandwidth: 1×params
+    reduce_scatter(gradients)
+    # GPU 0 gets grad[0:N/4], which matches its optimizer states[0:N/4]
+    # GPU 1 gets grad[N/4:N/2], which matches its optimizer states[N/4:N/2]
+    
+    # === OPTIMIZER STEP ===
+    # NO all_gather needed! Each GPU has matching grads & optimizer states
+    # GPU 0: updates params[0:N/4] using grad_shard[0:N/4] + adam_states[0:N/4]
+    # GPU 1: updates params[N/4:N/2] using grad_shard[N/4:N/2] + adam_states[N/4:N/2]
+    
+    # === PARAMETER SYNC ===  
+    # all_gather: Each GPU's updated params → all GPUs
+    # Bandwidth: 1×params
+    all_gather(parameters)
+
+# Memory: Saves 3×params (grads + Adam states) / world_size
+# Bandwidth: 1P (reduce_scatter) + 1P (all_gather) = 2×params ✨
 ```
 
 ## 🔄 ZeRO-3: Full Parameter Sharding
 
-**What's sharded**: Parameters + gradients + optimizer states  
-**Key difference**: Parameters stay sharded - no final all_gather needed
+**What's sharded**: Everything - params, gradients, optimizer states  
+**Key difference**: Parameters STAY sharded between training steps
 
 ```python
-# ZeRO-3 Training Step with 3 GPUs
-def zero3_training_step(model, batch, optimizer):
-    # === FORWARD PASS ===
-    # all_gather: Collect parameter shards to reconstruct full weights for computation
-    for layer in model.layers:
-        dist.all_gather(full_weight_list, my_weight_shard)
-        full_weight = torch.cat(full_weight_list, dim=0)
-        
-        # Compute with full parameters
-        layer_output = F.linear(layer_input, full_weight)
-        
-        # Immediately discard full parameters
-        del full_weight  # Back to sharded state
+# ZeRO-3 Training Step with Adam
+def zero3_training_step(model, batch):
+    # === FORWARD PASS (per layer) ===
+    # all_gather: Reconstruct full params from shards
+    # Bandwidth: 1×params (across all layers)
+    for layer in model:
+        all_gather(layer.weight_shards)  # Get full weight
+        output = forward(input, full_weight)
+        del full_weight  # Free memory immediately
     
-    # === BACKWARD PASS ===
-    for layer in reversed(model.layers):
-        # all_gather: Reconstruct full weights again for backward computation
-        dist.all_gather(full_weight_list, my_weight_shard)
-        full_weight = torch.cat(full_weight_list, dim=0)
+    # === BACKWARD PASS (per layer) ===
+    for layer in reversed(model):
+        # all_gather: Reconstruct full params again
+        # Bandwidth: 1×params (across all layers)
+        all_gather(layer.weight_shards)
         
         # Compute gradients
-        grad_output.backward()
+        grads = compute_gradients(full_weight, ...)
         
-        # reduce_scatter: Sum gradients across GPUs, distribute shards back
-        dist.reduce_scatter(my_grad_shard, [grad_weight], op=SUM)
-        my_grad_shard /= world_size
+        # reduce_scatter: Shard gradients across GPUs
+        # Bandwidth: 1×params (across all layers)
+        reduce_scatter(grads)
+        # GPU 0 gets grad_shard[0:N/4] matching its param_shard[0:N/4]
         
         del full_weight
     
     # === OPTIMIZER STEP ===
-    # Each GPU updates only its parameter shard - NO all_gather needed!
-    # Parameters stay sharded across GPUs
-    my_param_shard -= lr * my_grad_shard
-    optimizer.zero_grad()
+    # Each GPU updates ONLY its parameter shard
+    # No communication - params stay sharded!
+    # GPU 0: param_shard[0:N/4] -= lr * grad_shard[0:N/4] / sqrt(variance[0:N/4])
 
-# Memory: ~33% of DDP (everything sharded)
-# Communication: 2x all_gather(parameters) + reduce_scatter(gradients) per layer
-# Key: No final all_gather - parameters remain sharded
+# Memory: Saves 4×params (everything) / world_size  
+# Bandwidth: 1P + 1P (all_gather×2) + 1P (reduce_scatter) = 3×params
 ```
 
 ## 💾 Key Insights
 
-1. **reduce_scatter vs all_reduce**: More applicable for ZeRO-2 where gradients are actually sharded in memory, but used in ZeRO-1 for communication efficiency
+1. **ZeRO-2 matches DDP bandwidth!** Both use 2×params bandwidth:
+   - DDP: 2P for all_reduce
+   - ZeRO-2: 1P for reduce_scatter + 1P for all_gather
+   - This makes ZeRO-2 very attractive: 50% memory savings at no extra communication cost
 
-2. **Activation Memory**: ZeRO/FSDP provides **NO activation memory savings** - activations are a function of the data batch each GPU processes, not model parameters. Since each GPU processes different data, activations cannot be sharded
-
-3. **ZeRO-3 Communication**: Requires **two all_gather operations per layer** - once in forward pass, once in backward pass to reconstruct parameters for computation
-
-4. **Parameter Gathering**:
-   - **ZeRO-1/2**: Need final `all_gather(parameters)` because parameters are replicated
-   - **ZeRO-3**: No final all_gather - parameters stay sharded, will be gathered again when needed
-
-5. **Memory vs Communication Trade-off**: More sharding = less memory but more frequent parameter reconstruction
-
-6. **Bandwidth Reality Check**: 
-   ```python
-   # Bandwidth cost per collective operation (ring algorithm):
-   # For tensor of size M:
-   all_reduce:      ~2M  (NOT 4M - it's pipelined!)
-   all_gather:      ~2M
-   reduce_scatter:  ~2M
-   
-   # Total bandwidth by method:
-   DDP:       1×all_reduce = 2×params (once per batch)
-   ZeRO-1/2:  1×reduce_scatter + 1×all_gather = 4×params (once per batch)
-   ZeRO-3:    2×all_gather + 1×reduce_scatter = 6×params (per layer!)
+2. **Bandwidth costs** (per training step):
+   ```
+   DDP:     2P (all_reduce grads)
+   ZeRO-2:  2P (reduce_scatter grads + all_gather params)
+   ZeRO-1:  3P (all_reduce grads + all_gather params)
+   ZeRO-3:  3P (2×all_gather params + reduce_scatter grads)
    ```
 
-7. **FSDP Efficiency Threshold**: FSDP becomes efficient when B/N > 850 because:
-   ```python
-   # FSDP communication cost is fixed per layer
-   fsdp_comm_time = 6 × param_size × layers / bandwidth
-   
-   # Compute time scales with batch size
-   compute_time = batch_size × compute_per_example
-   
-   # Efficiency improves with larger batches:
-   efficiency = compute_time / (compute_time + fsdp_comm_time)
-            = 1 / (1 + constant/batch_size)
-            → 1 as batch_size increases
-   ```
-
-8. **Communication Frequency**: 
-   - DDP/ZeRO-1/2 communicate once per batch (can overlap with computation)
-   - ZeRO-3 communicates 3× per layer (hard to overlap, blocking operations)
-
-9. **When to Use Each**:
-   - **DDP/ZeRO-1**: Default choice for small models
-   - **ZeRO-2**: When gradient memory is significant
-   - **ZeRO-3/FSDP**: Only when model doesn't fit AND batch size is large
-   - **Tensor Parallel**: Keep within single node due to high bandwidth needs
+3. **Communication Frequency**:
+   - **ZeRO-1/2**: Once per batch
+   - **ZeRO-3**: Per layer (harder to overlap with compute)

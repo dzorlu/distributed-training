@@ -372,6 +372,36 @@ def example_all_reduce_decomposition():
     print(f"After ReduceScatter on rank {rank}: {output_tensor}")    
 
 
+def example_all_to_all():
+    # Initialize distributed (run with: torchrun --nproc_per_node=2 all_to_all_simple.py)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Each rank has different data
+    if rank == 0:
+        data = torch.tensor([1, 2, 3, 4])  # Rank 0's data
+    else:
+        data = torch.tensor([5, 6, 7, 8])  # Rank 1's data
+    
+    print(f"Rank {rank} initial data: {data}")
+    
+    # All-to-All: each rank sends half its data to each rank
+    # Split data into chunks (one per rank)
+    send_chunks = list(data.chunk(world_size))
+    recv_chunks = [torch.empty_like(send_chunks[0]) for _ in range(world_size)]
+    
+    # Perform all-to-all
+    dist.all_to_all(recv_chunks, send_chunks)
+    
+    # Combine received chunks
+    result = torch.cat(recv_chunks)
+    print(f"Rank {rank} after all-to-all: {result}")
+    
+    dist.destroy_process_group()
+
+    
+
 # ============================================================================
 # EXECUTION: Initialize distributed environment and run examples
 # ============================================================================
@@ -397,10 +427,13 @@ example_scatter()
 dist.barrier()
 print("***reduce-scatter**")
 example_reduce_scatter()
+dist.barrier()
+print("***all-to-all**")
+example_all_to_all()
 
 # ============================================================================
-# HOW TO RUN: torchrun --nproc_per_node=3 script.py
+# HOW TO RUN: torchrun --nproc_per_node=n script.py
 # ============================================================================
-# This spawns 3 processes, each bound to different GPU
+# This spawns n processes, each bound to different GPU
 # torchrun automatically sets environment variables for coordination
 # Each process runs this entire script, but operates on different data
