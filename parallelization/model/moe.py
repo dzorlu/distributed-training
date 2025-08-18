@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 import torch.nn.functional as F
+from .llama2_model import ModelArgs
 
 try:
     from grouped_gemm import ops
@@ -12,12 +13,6 @@ except ImportError:
 
 
 
-@dataclass
-class MoEModelArgs:
-    hidden_dim: int
-    num_experts: int
-    top_k: int
-    dim: int
 
 class Router(nn.Module):
     """
@@ -36,7 +31,7 @@ class Router(nn.Module):
         model_args (MoEModelArgs): A dataclass containing the configuration for
             the MoE layer, including hidden_dim, num_experts, and top_k.
     """
-    def __init__(self, model_args: MoEModelArgs):
+    def __init__(self, model_args: ModelArgs):
         super().__init__()
         
         self.model_args = model_args
@@ -114,12 +109,31 @@ class Router(nn.Module):
 
 
 class GroupedExpert(nn.Module):
-    """
-    Implements the expert computation for a Mixture of Experts (MoE) layer
-    using grouped matrix multiplication (GEMM).
-    
-    """
-    def __init__(self, model_args: MoEModelArgs):
+    def __init__(self, model_args: ModelArgs):
+        """
+        Implements a grouped MLP computation for multiple experts using grouped GEMM operations.
+        
+        This module efficiently processes tokens assigned to different experts in a single
+        batched operation. Each expert has its own set of MLP weights (w1, w2, w3), and
+        tokens are processed by their assigned experts using grouped matrix multiplications.
+        
+        The MLP follows a SwiGLU-style architecture:
+        - Two parallel projections: w1 (gate) and w3 (up)
+        - SiLU activation on w1's output
+        - Element-wise multiplication of activated w1 and w3 outputs
+        - Down projection with w2
+        
+        Args:
+            model_args (MoEModelArgs): Configuration containing:
+                - num_experts: Number of expert networks
+                - hidden_dim: Input/output dimension of the MLP
+                - dim: Hidden dimension of the MLP (intermediate size)
+        
+        Attributes:
+            w1 (nn.Parameter): Gate projection weights. Shape: (num_experts, hidden_dim, dim)
+            w2 (nn.Parameter): Down projection weights. Shape: (num_experts, dim, hidden_dim)
+            w3 (nn.Parameter): Up projection weights. Shape: (num_experts, hidden_dim, dim)
+        """
         super().__init__()
         self.model_args = model_args
         self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.hidden_dim, model_args.dim))
@@ -129,6 +143,28 @@ class GroupedExpert(nn.Module):
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         """
         Performs the forward pass for all experts on a packed tensor of tokens.
+
+        
+        Performs the forward pass for all experts on a packed tensor of tokens.
+        
+        The tokens in x are ordered by expert assignment (all tokens for expert 0,
+        then all for expert 1, etc.), as prepared by the Router module.
+        
+        Args:
+            x (torch.Tensor): Packed tensor of tokens ordered by expert assignment.
+                Shape: (batch_size * seq_len * top_k, hidden_dim)
+            num_tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert.
+                Shape: (num_experts,). Sum should equal batch_size * seq_len * top_k.
+        
+        Returns:
+            torch.Tensor: Expert outputs in the same packed format as input.
+                Shape: (batch_size * seq_len * top_k, hidden_dim)
+        
+        Computation flow:
+            x -> w1 -> SiLU ──┐
+                              ├─> * -> w2 -> out
+            x -> w3 ──────────┘
+
         """
         # Move batch sizes to CPU
         num_tokens_per_expert_cpu = num_tokens_per_expert.to("cpu").to(torch.int64)
@@ -154,7 +190,7 @@ class MoE(nn.Module):
     A complete Mixture of Experts (MoE) layer that composes a Router and
     GroupedExpert modules.
     """
-    def __init__(self, model_args: MoEModelArgs):
+    def __init__(self, model_args: ModelArgs):
         super().__init__()
         self.model_args = model_args
         self.router = Router(model_args)
@@ -194,3 +230,17 @@ class MoE(nn.Module):
         
         # 5. Reshape the output back to the original input shape.
         return out_flat.reshape(bsz, seq, dim)
+
+    @classmethod
+    def from_model_args(cls, model_args: ModelArgs) -> "MoE":
+        """
+        Initialize a MoE model from a ModelArgs object.
+
+        Args:
+            model_args (ModelArgs): Model configuration arguments.
+
+        Returns:
+            MoE: MoE model.
+
+        """
+        return cls(model_args)

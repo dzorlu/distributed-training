@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import Shard, DTensor
 
+from .moe import MoE
+
 def debug_dtensor(tensor, name):
     if isinstance(tensor, DTensor):
         print(f"{name}:")
@@ -37,6 +39,11 @@ class ModelArgs:
     # mer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+
+    # moe
+    hidden_dim: int = None
+    num_experts: int = None
+    top_k: int = None
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -308,12 +315,15 @@ class TransformerBlock(nn.Module):
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
         self.attention = Attention(model_args)
-        self.feed_forward = FeedForward(
-            dim=model_args.dim,
-            hidden_dim=4 * model_args.dim,
-            multiple_of=model_args.multiple_of,
-            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
-        )
+        if model_args.is_moe:
+            self.feed_forward = MoE(model_args=model_args)
+        else:
+            self.feed_forward = FeedForward(
+                dim=model_args.dim,
+                hidden_dim=4 * model_args.dim,
+                multiple_of=model_args.multiple_of,
+                ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            )
         self.layer_id = layer_id
         self.num_layers = model_args.n_layers
 

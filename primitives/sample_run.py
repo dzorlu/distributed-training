@@ -392,6 +392,8 @@ def example_all_to_all():
     recv_chunks = [torch.empty_like(send_chunks[0]) for _ in range(world_size)]
     
     # Perform all-to-all
+    # Oth GPU gets all 0th rows etc.
+    # distributed transpose
     dist.all_to_all(recv_chunks, send_chunks)
     
     # Combine received chunks
