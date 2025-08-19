@@ -1,6 +1,4 @@
-from parallelization.model.llama2_model import Transformer
-from parallelization.model.moe import MoE
-from parallelization.model.llama2_model import ModelArgs
+
 import argparse
 import os
 import re
@@ -10,12 +8,14 @@ import importlib
 from parallelization import ray_distributed, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
 from parallelization.profiler.utils import log_parameter_count
-from torch.distributed.tensor.debug import CommDebugMode
-import torch.distributed as dist
+from parallelization.model.llama2_model import Transformer
+from parallelization.model.llama2_model import ModelArgs
 
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.debug import CommDebugMode
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
@@ -23,14 +23,23 @@ from torch.distributed.tensor import Shard, Replicate
 from torch.distributed.fsdp import fully_shard
 from torch.optim import Adam
 
-def get_plan(plan_name: str):
-    """Dynamically import and return the parallelization plan."""
+
+def apply_parallelization(
+    model: torch.nn.Module,
+    model_name: str,
+    world_mesh: DeviceMesh,
+    model_args: ModelArgs,
+    rank: int
+):
+    """Dynamically import and apply the parallelization plan from the model's directory."""
     try:
-        module = importlib.import_module(f"parallelization.{plan_name}.{plan_name}")
-        plan_variable_name = f"{plan_name}_plan"
-        return getattr(module, plan_variable_name)
+        module_path = f"parallelization.{model_name}.parallelize"
+        parallelize_module_import = importlib.import_module(module_path)
+        parallelize_fn = getattr(parallelize_module_import, "parallelize")
+        # This function will now apply the parallelization in-place on the model
+        parallelize_fn(model, world_mesh, model_args, rank)
     except (ModuleNotFoundError, AttributeError) as e:
-        raise ImportError(f"Could not import plan '{plan_name}'. Make sure the plan exists and the naming convention is followed.") from e
+        raise ImportError(f"Could not import or find 'parallelize' function in '{module_path}'. Make sure the module and function exist.") from e
 
 
 def extract_unique_param_names(model):
@@ -60,39 +69,44 @@ def main(args):
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)   # set by torchrun
-    device = torch.device("cuda", local_rank)   
+    device = torch.device("cuda", local_rank)
     print(f"device: {device}")        # pin this process to its GPU
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
-    # For now, let's assume a 1D mesh for simplicity, suitable for EP.
-    # We can add more complex mesh logic later.
-    device_mesh = init_device_mesh("cuda", (world_size,))
-    dp_rank = 0 # Assuming no data parallelism for now.
-
-    model_args = ModelArgs()
     if args.use_moe:
-        # PoC
-        model = MoE.from_model_args(model_args=model_args)
+        # 2D mesh for TP and EP
+        if args.tp_size * args.ep_size != world_size:
+            raise ValueError(f"World size {world_size} must be equal to tp_size * ep_size")
+        
+        device_mesh = init_device_mesh(
+            "cuda",
+            (args.ep_size, args.tp_size),
+            mesh_dim_names=("ep", "tp")
+        )
     else:
-        model = Transformer.from_model_args(model_args)
+        # 1D mesh for TP
+        if world_size != args.tp_size:
+            # warn user that tp_size is being ignored
+            print(f"Warning: --tp-size ({args.tp_size}) is ignored for non-MoE models. Using world_size ({world_size}) for TP.")
+        device_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
+
+
+    model_args = ModelArgs(is_moe=args.use_moe)
+    model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
-    #model.init_weights()
 
 
-    param_names = extract_unique_param_names(model)
-    print(param_names)
-
-    # Dynamically get the parallelization plan
-    parallelization_plan = get_plan('ep')
-
-    model = parallelize_module(
-        module=model,
-        device_mesh=device_mesh,
-        parallelize_plan=parallelization_plan
+    # Dynamically apply parallelization plan
+    apply_parallelization(
+        model=model,
+        model_name=args.model_name,
+        world_mesh=device_mesh,
+        model_args=model_args,
+        rank=local_rank
     )
-
-    print("=== Parameter Analysis ===")
+    
+    print("=== Parameter Analysis After Parallelization ===")
     regular_tensors = []
     dtensors = []
 
@@ -118,7 +132,8 @@ def main(args):
     def training_step(x, step_num=None):
         comm_mode = CommDebugMode()
         with comm_mode:
-            loss = model(x).sum()
+            # Fake forward pass for now
+            loss = model(torch.randint(0, model_args.vocab_size, x.shape, device=x.device)).sum()
         if dist.get_rank() == 0:
             print(f"------------- COMM DEBUG MODE: Step {step_num} -------------")
             comm_mode.log_comm_debug_tracing_table_to_file(file_name=f"comm_debug_{step_num}.txt")
@@ -129,9 +144,8 @@ def main(args):
     batch_size = 2
     seq_len = 128
     for i in range(num_iter):
-        # seeding with dp_rank to ensure identical inputs for TP groups
-        torch.manual_seed(i + dp_rank)
-        #x = torch.randint(model_args.vocab_size, (batch_size, seq_len)).to(device)
+        # seeding with rank to ensure identical inputs for TP groups
+        torch.manual_seed(i + dist.get_rank())
         x = torch.rand(batch_size, seq_len, model_args.dim).to(device)
         loss = training_step(x, step_num=i)
         optimizer.step()
@@ -145,9 +159,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch Distributed Training")
     parser.add_argument("--use-moe", action="store_true", help="Whether to use MoE")
+    parser.add_argument("--model-name", type=str, default="model", help="The name of the model folder under /parallelization")
+    parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
+    parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size for MoE models")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
-    parser.add_argument("--fsdp-enable", action="store_true", help="Enable FSDP with 2D parallelism")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")

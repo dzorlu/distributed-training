@@ -253,13 +253,3 @@ class ExpertParallel(ParallelStyle):
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )
-
-ep_plan = {
-    # similar to FFN.
-    "layers.*.moe": PrepareModuleInput(
-        input_layouts=(Shard(1),),  # From ffn_norm
-        desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
-        #TODO: output layout / desired
-    ),
-    "layers.*.moe.experts": ExpertParallel(),
-}
