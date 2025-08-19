@@ -2,7 +2,11 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 import torch.nn.functional as F
-from .llama2_model import ModelArgs
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+
+from .args import ModelArgs
 
 try:
     from grouped_gemm import ops
@@ -10,6 +14,9 @@ except ImportError:
     raise RuntimeError(
         "Grouped GEMM is not available. Please run `pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main` (takes less than 5 minutes)"
     )
+
+
+from torch.distributed.tensor.debug import visualize_sharding
 
 
 
@@ -35,7 +42,7 @@ class Router(nn.Module):
         super().__init__()
         
         self.model_args = model_args
-        self.router = nn.Linear(model_args.hidden_dim, model_args.num_experts, bias=False)
+        self.router = nn.Linear(model_args.dim, model_args.num_experts, bias=False)
         
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -76,7 +83,7 @@ class Router(nn.Module):
         # [num_experts]
         # Example: [2.0, 2.0, 2.0, 2.0] # each expert gets 2.
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1).float(),
+            selected_experts_indices.view(-1),
             bins=self.model_args.num_experts,
             min=0,            
             max=self.model_args.num_experts,
@@ -136,9 +143,9 @@ class GroupedExpert(nn.Module):
         """
         super().__init__()
         self.model_args = model_args
-        self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.hidden_dim, model_args.dim))
-        self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.hidden_dim))
-        self.w3 = nn.Parameter(torch.empty(model_args.num_experts, model_args.hidden_dim, model_args.dim))
+        self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
+        self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
+        self.w3 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         """
@@ -171,11 +178,29 @@ class GroupedExpert(nn.Module):
         
         # Convert to bfloat16 if needed (grouped_gemm supports it)
         x_bf16 = x.to(torch.bfloat16)
-        w1_bf16 = self.w1.to(torch.bfloat16)
-        w2_bf16 = self.w2.to(torch.bfloat16)
-        w3_bf16 = self.w3.to(torch.bfloat16)
 
+        if isinstance(self.w1, DTensor):
+            # The weights are DTensors. We need to convert them to local tensors
+            # to use them with non-DTensor aware ops like ops.gmm
+            if dist.get_rank() == 0:
+                print(f"w1 is a DTensor with global shape: {self.w1.shape}")
+                print(f"w1 local shape: {self.w1.to_local().shape}")
+
+            w1_bf16 = self.w1.to_local().to(torch.bfloat16)
+            w2_bf16 = self.w2.to_local().to(torch.bfloat16)
+            w3_bf16 = self.w3.to_local().to(torch.bfloat16)
+        else:
+            # The weights are regular tensors, so we can use them directly
+            w1_bf16 = self.w1.to(torch.bfloat16)
+            w2_bf16 = self.w2.to(torch.bfloat16)
+            w3_bf16 = self.w3.to(torch.bfloat16)
+        
         # MLP layers with activation
+        # Expected batch_sizes.size(0) == num_experts
+        # x_bf16.shape=torch.Size([551, 4096]), 
+        # w1_bf16.shape=torch.Size([8, 4096, 4096]) 
+        # num_tokens_per_expert_cpu=tensor([484,  67])
+        print(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
         x1 = ops.gmm(x_bf16, w1_bf16, num_tokens_per_expert_cpu, trans_b=False)
         x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
         h = F.silu(x1) * x3

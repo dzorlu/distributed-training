@@ -1,7 +1,10 @@
 # parallelization/model/train.py
 import argparse
 import torch
-from parallelization.model.moe import MoE, MoEModelArgs
+from parallelization.model.moe import MoE
+from parallelization.model.args import ModelArgs
+
+# python -m parallelization.model.test.test_moe --profile --gpus-per-node 2
 
 
 def main():
@@ -15,7 +18,7 @@ def main():
     torch.manual_seed(0)
     
     # Create model
-    moe_args = MoEModelArgs(hidden_dim=16, num_experts=4, top_k=2, dim=32)
+    moe_args = ModelArgs(hidden_dim=16, num_experts=4, top_k=2, dim=32)
     model = MoE(moe_args).to(device)
     
     # Create input

@@ -52,6 +52,7 @@ class ExpertParallel(ParallelStyle):
                     param, device_mesh, [Shard(0)]
                 )
             )
+            print(f"{name=}")
             module.register_parameter(name, dist_param)
 
     def _token_dispatch(self, model, inputs, device_mesh):
@@ -60,8 +61,8 @@ class ExpertParallel(ParallelStyle):
             input_splits is different coming from each device (assuming some data parallelism)
         """
         ep_size = device_mesh.shape[0]
-
-        x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted = inputs
+        print(f"{ep_size=}")
+        x_gathered, num_tokens_per_expert = inputs
         num_tokens_per_expert_group = num_tokens_per_expert.new_empty(
             num_tokens_per_expert.shape[0]
         )
@@ -119,8 +120,9 @@ class ExpertParallel(ParallelStyle):
         #   but is grouped by source GPU, not by expert ID. It needs a local shuffle.
 
         # all_to_all_single_autograd allows differentiable data transfer
+        print(f"{self.output_splits=} {self.input_splits=}")
 
-        all_to_all_single_autograd(
+        x_gathered = all_to_all_single_autograd(
             x_gathered,
             self.output_splits,
             self.input_splits,
@@ -177,9 +179,9 @@ class ExpertParallel(ParallelStyle):
         #  [ 9,  4],  <- GPU 1: 9 tokens for E0, 4 for E1
         #  [14,  2],  <- GPU 2: 14 tokens for E0, 2 for E1
         #  [ 3, 11]]  <- GPU 3: 3 tokens for E0, 11 for E1
-        _repeat = num_tokens_per_expert_group.shape[0] // ep_size
+        expert_per_device = num_tokens_per_expert_group.shape[0] // ep_size
         expert_ids = torch.repeat_interleave(
-            torch.arange(ep_size).repeat(_repeat),  # [0, 1, 0, 1, 0, 1, 0, 1] - expert pattern
+            torch.arange(expert_per_device).repeat(ep_size).to('cuda'),  # [0, 1, 0, 1, 0, 1, 0, 1] - expert pattern
             num_tokens_per_expert_group  # [10,5,9,4,14,2,3,11] - repeat counts
         )
         
@@ -192,7 +194,7 @@ class ExpertParallel(ParallelStyle):
         x_reorganized = x_gathered[self.index, :]
 
         # per expert aggregation
-        num_tokens_per_expert_group_agg = tokens.sum(dim=0)
+        num_tokens_per_expert_group_agg = tokens.sum(dim=1)
 
         return x_reorganized, num_tokens_per_expert_group_agg
 

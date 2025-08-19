@@ -2,7 +2,6 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 # ported from https://github.com/pytorch/examples/blob/main/distributed/tensor_parallelism/llama2_model.py
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -11,6 +10,7 @@ from torch import nn
 from torch.distributed.tensor import Shard, DTensor
 
 from .moe import MoE
+from .args import ModelArgs
 
 def debug_dtensor(tensor, name):
     if isinstance(tensor, DTensor):
@@ -22,28 +22,7 @@ def debug_dtensor(tensor, name):
         print(f"{name}: Regular tensor {tensor.shape}")
 
 
-@dataclass
-class ModelArgs:
-    dim: int = 4096 #2048
-    n_layers: int = 64 #64
-    n_heads: int = 16
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = 1000  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
 
-    max_batch_size: int = 32
-    max_seq_len: int = 32768
-    # If `True`, then each transfor
-    # mer block init uses its layer ID, and if
-    # `False`, each uses the total number of transformer blocks
-    depth_init: bool = True
-
-    # moe
-    hidden_dim: int = None
-    num_experts: int = None
-    top_k: int = None
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
