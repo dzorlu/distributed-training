@@ -143,9 +143,10 @@ class GroupedExpert(nn.Module):
         """
         super().__init__()
         self.model_args = model_args
-        self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
-        self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
-        self.w3 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim))
+        # fine-grained ratio
+        self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim // 4))
+        self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim // 4, model_args.dim))
+        self.w3 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim // 4))
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         """
@@ -182,10 +183,6 @@ class GroupedExpert(nn.Module):
         if isinstance(self.w1, DTensor):
             # The weights are DTensors. We need to convert them to local tensors
             # to use them with non-DTensor aware ops like ops.gmm
-            if dist.get_rank() == 0:
-                print(f"w1 is a DTensor with global shape: {self.w1.shape}")
-                print(f"w1 local shape: {self.w1.to_local().shape}")
-
             w1_bf16 = self.w1.to_local().to(torch.bfloat16)
             w2_bf16 = self.w2.to_local().to(torch.bfloat16)
             w3_bf16 = self.w3.to_local().to(torch.bfloat16)
@@ -197,16 +194,14 @@ class GroupedExpert(nn.Module):
         
         # MLP layers with activation
         # Expected batch_sizes.size(0) == num_experts
-        # x_bf16.shape=torch.Size([551, 4096]), 
-        # w1_bf16.shape=torch.Size([8, 4096, 4096]) 
-        # num_tokens_per_expert_cpu=tensor([484,  67])
-        print(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
+        #print(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
         x1 = ops.gmm(x_bf16, w1_bf16, num_tokens_per_expert_cpu, trans_b=False)
         x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
         h = F.silu(x1) * x3
         out = ops.gmm(h, w2_bf16, num_tokens_per_expert_cpu, trans_b=False)
         
         # Convert back to original dtype
+        # TODO: This needs to be recast to Dtype
         return out.to(x.dtype)
 
 

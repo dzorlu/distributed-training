@@ -61,7 +61,6 @@ class ExpertParallel(ParallelStyle):
             input_splits is different coming from each device (assuming some data parallelism)
         """
         ep_size = device_mesh.shape[0]
-        print(f"{ep_size=}")
         x_gathered, num_tokens_per_expert = inputs
         num_tokens_per_expert_group = num_tokens_per_expert.new_empty(
             num_tokens_per_expert.shape[0]

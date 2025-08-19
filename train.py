@@ -114,7 +114,7 @@ def main(args):
     # foreach=False is not optimized.
     optimizer = Adam(model.parameters(), lr=0.25, foreach=False)
 
-    @flop_counter(model, enabled=args.profile, step_to_measure=1)
+    @flop_counter(model, enabled=args.profile, step_to_measure=2)
     def training_step(x, step_num=None):
         comm_mode = CommDebugMode()
         with comm_mode:

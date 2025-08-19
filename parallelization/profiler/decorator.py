@@ -20,7 +20,6 @@ def flop_counter(model, enabled=True, step_to_measure=1):
         @wraps(func)
         def wrapper(*args, step_num=None, **kwargs):
             if enabled and step_num == step_to_measure:
-                # Your exact existing logic
                 from torch.utils.flop_counter import FlopCounterMode
                 import time
                 
@@ -32,7 +31,8 @@ def flop_counter(model, enabled=True, step_to_measure=1):
                     t_lapsed = time.time() - t
                     # TODO: (dzorlu) grab the model name from the model
                     #total_flops = sum(ftdm.flop_counts['FSDPTransformer'].values()) 
-                    total_flops = sum(ftdm.flop_counts['Transformer'].values())                
+                    #total_flops = sum(ftdm.flop_counts['Transformer'].values())  
+                    total_flops = sum(ftdm.flop_counts['MoE'].values())                
                     tflops = total_flops / t_lapsed / 1e12
                     print(f"rank {rank} step {step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
                     return result
