@@ -87,9 +87,8 @@ def main(args):
     else:
         # 1D mesh for TP
         if world_size != args.tp_size:
-            # warn user that tp_size is being ignored
-            print(f"Warning: --tp-size ({args.tp_size}) is ignored for non-MoE models. Using world_size ({world_size}) for TP.")
-        device_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
+            raise ValueError(f"World size {world_size} must be equal to tp_size {args.tp_size} for non-MoE models")
+        device_mesh = init_device_mesh("cuda", (args.tp_size,), mesh_dim_names=("tp",))
 
 
     model_args = ModelArgs(is_moe=args.use_moe)
@@ -133,7 +132,7 @@ def main(args):
         comm_mode = CommDebugMode()
         with comm_mode:
             # Fake forward pass for now
-            loss = model(torch.randint(0, model_args.vocab_size, x.shape, device=x.device)).sum()
+            loss = model(x).sum()
         if dist.get_rank() == 0:
             print(f"------------- COMM DEBUG MODE: Step {step_num} -------------")
             comm_mode.log_comm_debug_tracing_table_to_file(file_name=f"comm_debug_{step_num}.txt")
@@ -146,7 +145,7 @@ def main(args):
     for i in range(num_iter):
         # seeding with rank to ensure identical inputs for TP groups
         torch.manual_seed(i + dist.get_rank())
-        x = torch.rand(batch_size, seq_len, model_args.dim).to(device)
+        x = torch.randint(0, model_args.vocab_size, (batch_size, seq_len), device=device)
         loss = training_step(x, step_num=i)
         optimizer.step()
 
