@@ -91,7 +91,7 @@ def main(args):
         device_mesh = init_device_mesh("cuda", (args.tp_size,), mesh_dim_names=("tp",))
 
 
-    model_args = ModelArgs(is_moe=args.use_moe)
+    model_args = ModelArgs(use_moe=args.use_moe)
     model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
 
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-moe", action="store_true", help="Whether to use MoE")
     parser.add_argument("--model-name", type=str, default="model", help="The name of the model folder under /parallelization")
     parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
-    parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size for MoE models")
+    parser.add_argument("--ep-size", type=int, default=2, help="Expert parallel size for MoE models")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
     

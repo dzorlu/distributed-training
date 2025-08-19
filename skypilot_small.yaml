@@ -2,7 +2,7 @@ name: verl-interactive-multinode
 
 resources:
   accelerators:
-    L4: &gpu_count 2
+    L4: &gpu_count 4
     RTX6000-Ada: *gpu_count
     RTX4090: *gpu_count
     RTX3090: *gpu_count
@@ -63,6 +63,7 @@ setup: |
   # Official Ray install w/ ML extras
   python -m pip install -U "ray[data,train,tune,serve]"    # Ray docs recommend this for ML. 
   python -m pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main
+  python -m pip install tabulate
   
   # Persist envs for interactive shells
   {
