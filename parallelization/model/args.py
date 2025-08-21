@@ -3,7 +3,7 @@ from typing import Optional
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096 #2048
+    dim: int = 1024 #2048
     n_layers: int = 64 #64
     n_heads: int = 16
     n_kv_heads: Optional[int] = None
@@ -22,3 +22,4 @@ class ModelArgs:
     # moe
     num_experts: int = 8
     top_k: int = 2
+    use_moe: bool = False

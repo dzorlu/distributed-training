@@ -1,5 +1,5 @@
-from parallelization.train.llama2_model import Transformer
-from parallelization.train.llama2_model import ModelArgs
+from .llama2_model import Transformer
+from .args import ModelArgs
 import argparse
 import os
 import re
@@ -9,6 +9,7 @@ import re
 from parallelization import ray_distributed, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
 from parallelization.profiler.utils import log_parameter_count
+from .expert_parallel import ExpertParallel
 
 
 
@@ -21,16 +22,16 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
     SequenceParallel,
     PrepareModuleInput,
+    PrepareModuleInputOutput,
 )
-from torch.distributed.tensor import distribute_tensor, Shard, Replicate
+from torch.distributed.tensor import distribute_tensor, Shard, Replicate, Partial
 from torch.distributed.fsdp import fully_shard
 
-from .expert_parallel import ExpertParallel
-
-from torchtitan.tools.logging import logger
 
 
-plan = {
+
+
+tp_plan = {
     # === Embeddings ===
     # Transferring lower payload embedding dimension (vs ~40k dimensional payload)
     "tok_embeddings": RowwiseParallel(
@@ -105,14 +106,37 @@ ffn_plan = {
     "layers.*.feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)),
 }
 
-ep_plan = {
+# moe_ep_tp_plan = {
+#     "layers.*.moe.experts": ExpertParallel(),
+# }
+
+moe_tp_plan = {
     # similar to FFN.
-    "layers.*.moe": PrepareModuleInput(
+    "layers.*.feed_forward": PrepareModuleInputOutput(
         input_layouts=(Shard(1),),  # From ffn_norm
         desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
-        #TODO: output layout / desired
+        use_local_input=True,
+        use_local_output=True,
+        # this is effectively reduce-scatter
+        # data out of moe layer is different across the devices, so
+        # it has to be reduced then scattered for upcoming norm layer
+        # he _token_combine function handles the communication 
+        # for Expert Parallelism. 
+        # The output_layouts=(Partial(),) 
+        # and desired_output_layouts=(Shard(1),) 
+        # handle the communication for Tensor Parallelism, 
+        # specifically completing the 
+        # RowwiseParallel operation within the experts 
+        # by performing a reduce-scatter. 
+        # This two-level communication strategy 
+        # is essential for combining EP and TP effectively.
+
+        # these two are true regardless whether we do EP or not.
+        output_layouts=(Partial(),),
+        # back to norm
+        desired_output_layouts=(Shard(1),),
+
     ),
-    "layers.*.moe.experts": ExpertParallel(),
 }
 
 
@@ -121,44 +145,39 @@ def parallelize(model: nn.Module, world_mesh: DeviceMesh, model_args: ModelArgs,
         Parallelize for TP and (optionally) EP dimensions
     """
     
-    if model_args.is_moe:
-        # 2D parallelization
-        ep_mesh = world_mesh.get_group('ep')
-        tp_mesh = world_mesh.get_group('tp')
-        
-        logger.info(
-            f"Applying 2D parallelism: TP size {tp_mesh.size()}, EP size {ep_mesh.size()}"
-        )
-        
-        # Apply TP to the base model parts
+    ep_mesh = world_mesh['ep']
+    ep_size = ep_mesh.size()
+    tp_mesh = world_mesh['tp']
+    tp_size = tp_mesh.size()
+
+    # TP parallel
+    parallelize_module(
+        module=model,
+        device_mesh=tp_mesh,
+        parallelize_plan=tp_plan,
+    )
+
+    if model_args.use_moe:
+        # Moe layers are both EP/TP.
+        # Manually apply ExpertParallel to bypass validation in parallelize_module
+        # This includes token dispath and token gather modules at the boundaries.
+        expert_parallel_style = ExpertParallel()
+        for layer in model.layers:
+            expert_parallel_style._apply(layer.feed_forward.experts, world_mesh['ep','tp'])
+
+        # moe input preparation goes into TP region.
         parallelize_module(
             module=model,
             device_mesh=tp_mesh,
-            parallelize_plan=plan,
-        )
-        
-        # Apply EP to the MoE layers
-        parallelize_module(
-            module=model,
-            device_mesh=ep_mesh,
-            parallelize_plan=ep_plan,
+            parallelize_plan=moe_tp_plan,
         )
     else:
-        # 1D parallelization (TP only)
-        tp_mesh = world_mesh
-        logger.info(
-            f"Applying 1D parallelism: TP size {tp_mesh.size()}"
-        )
-        
-        # TP parallel for the whole model
-        full_plan = {**plan, **ffn_plan}
+        # If not MoE, parallelize FFN in TP
         parallelize_module(
             module=model,
             device_mesh=tp_mesh,
-            parallelize_plan=full_plan,
+            parallelize_plan=ffn_plan,
         )
-    
-
 
 
 

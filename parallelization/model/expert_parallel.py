@@ -63,19 +63,22 @@ class ExpertParallel(ParallelStyle):
         Applies to TP + EP
         The weights are 3D (num_experts, dim, hidden_dim)
         """
-        for name, param in module.named_parameters():
-            if 'w2' in name:
-                _shard = [Shard(0), Shard(2)]
-            else:
-                _shard = [Shard(0), Shard(2)]
-        
-            dist_param = nn.Parameter(
-                distribute_tensor(
-                    param, device_mesh, _shard
-                )
-            )
-            print(f"{name=}")
-            module.register_parameter(name, dist_param)
+        module.register_parameter(
+            "w1",
+            nn.Parameter(distribute_tensor(module.w1, device_mesh, [Shard(0), Shard(1)])),
+        )  # Column-wise sharding
+
+        # w2 shape = (experts, in_dim, out_dim)
+        module.register_parameter(
+            "w2",
+            nn.Parameter(distribute_tensor(module.w2, device_mesh, [Shard(0), Shard(2)])),
+        )  # Row-wise sharding
+
+        # w3 shape = (experts, out_dim, in_dim)
+        module.register_parameter(
+            "w3",
+            nn.Parameter(distribute_tensor(module.w3, device_mesh, [Shard(0), Shard(1)])),
+        )  # Column-wise sharding
 
 
     def _token_dispatch(self, model, inputs, device_mesh):
@@ -107,9 +110,8 @@ class ExpertParallel(ParallelStyle):
         dist.all_to_all_single(
             num_tokens_per_expert_group, # output!
             num_tokens_per_expert, # input
-            group=device_mesh.get_group(),
+            group=device_mesh.get_all_groups(),
         )
-
 
         input_splits = num_tokens_per_expert.view(
             ep_size, -1
@@ -241,15 +243,16 @@ class ExpertParallel(ParallelStyle):
 
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        if device_mesh.get('tp') and device_mesh.get('ep'):
+        if device_mesh['tp'] and device_mesh['ep']:
             _partition_fn = self._partition_2d_fn
         else:
             _partition_fn = self._partition_fn
+        print(f"{device_mesh=} {_partition_fn=}")
 
         return distribute_module(
             module,
             device_mesh,
-            partition_fn=self._partition_fn,
+            partition_fn=_partition_fn,
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )

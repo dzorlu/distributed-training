@@ -294,7 +294,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
         self.attention = Attention(model_args)
-        if model_args.is_moe:
+        if model_args.use_moe:
             self.feed_forward = MoE(model_args=model_args)
         else:
             self.feed_forward = FeedForward(

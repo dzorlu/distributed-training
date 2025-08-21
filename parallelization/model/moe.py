@@ -1,3 +1,4 @@
+from re import I
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
@@ -114,6 +115,9 @@ class Router(nn.Module):
         
         return x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted
 
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std)
+
 
 class GroupedExpert(nn.Module):
     def __init__(self, model_args: ModelArgs):
@@ -204,6 +208,11 @@ class GroupedExpert(nn.Module):
         # TODO: This needs to be recast to Dtype
         return out.to(x.dtype)
 
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.w3, mean=0.0, std=init_std)
+
 
 class MoE(nn.Module):
     """
@@ -218,6 +227,7 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor):
         bsz, seq, dim = x.shape
+        print(f"{bsz=}, {seq=}, {dim=}")
         x_flat = x.reshape(-1, dim)
 
         # 1. Get routing plan, gathered tokens, and scores from the router.
@@ -250,6 +260,11 @@ class MoE(nn.Module):
         
         # 5. Reshape the output back to the original input shape.
         return out_flat.reshape(bsz, seq, dim)
+
+    def init_weights(self, init_std: float):
+        self.router.init_weights(init_std=init_std)
+        self.experts.init_weights(init_std=init_std)
+
 
     @classmethod
     def from_model_args(cls, model_args: ModelArgs) -> "MoE":

@@ -118,9 +118,9 @@ def main(args):
     print(f"DTensors: {len(dtensors)}")
     print(f"Regular tensors: {len(regular_tensors)}")
     if regular_tensors:
-        print("Regular tensor parameters:")
+        print(f"{device=} Regular tensor parameters:")
         for name in regular_tensors:
-            print(f"  {name}")
+            print(f"{device=}, {name=}")
 
     model = model.to(device) # need to do this still.
 
