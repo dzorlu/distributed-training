@@ -3,11 +3,13 @@ import argparse
 import torch
 from parallelization.model.moe import MoE
 from parallelization.model.args import ModelArgs
+from ...logging import logger, init_logger
 
 # python -m parallelization.model.test.test_moe --profile --gpus-per-node 2
 
 
 def main():
+    init_logger()
     parser = argparse.ArgumentParser()
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--gpus-per-node', type=int, default=1)
@@ -32,15 +34,15 @@ def main():
             record_shapes=True
         ) as prof:
             y = model(x)
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     else:
         y = model(x)
     
     # Verify
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
-    print(f"✓ Forward pass successful on {device}")
-    print(f"  Input shape: {x.shape}, Output shape: {y.shape}")
+    logger.info(f"✓ Forward pass successful on {device}")
+    logger.info(f"  Input shape: {x.shape}, Output shape: {y.shape}")
 
 
 if __name__ == '__main__':

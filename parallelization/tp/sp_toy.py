@@ -5,6 +5,7 @@ from parallelization import dtensor
 import torch
 import torch.nn as nn
 import logging
+from ..logging import logger, init_logger
 
 from torch.distributed.tensor import Shard, DTensor
 import torch.distributed as dist
@@ -112,7 +113,7 @@ class ToyModel(nn.Module):
         self.relu = nn.ReLU()
         self.out_proj = nn.Linear(out_features, 5)
         self.rank = rank
-        print(f"model at rank: {self.rank}")
+        logger.info(f"model at rank: {self.rank}")
 
 
     def forward(self, x):
@@ -122,18 +123,19 @@ class ToyModel(nn.Module):
                 return tensor.placements[0]
             return "Local Tensor"
 
-        print(f"[{self.rank}] {x.shape} before in_proj - {get_placement(x)}")
+        logger.info(f"[{self.rank}] {x.shape} before in_proj - {get_placement(x)}")
         x = self.in_proj(x)
-        print(f"[{self.rank}] {x.shape} before relu - {get_placement(x)}")
+        logger.info(f"[{self.rank}] {x.shape} before relu - {get_placement(x)}")
         x = self.relu(x)
-        print(f"[{self.rank}] {x.shape} before out_proj  - {get_placement(x)}")
+        logger.info(f"[{self.rank}] {x.shape} before out_proj  - {get_placement(x)}")
         out = self.out_proj(x)
-        print(f"[{self.rank}] {out.shape} after out_proj - {get_placement(out)}")
+        logger.info(f"[{self.rank}] {out.shape} after out_proj - {get_placement(out)}")
         return out
 
 
 if __name__ == "__main__":
-    print(torch.__version__)
+    init_logger()
+    logger.info(torch.__version__)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)   # set by torchrun
     device = torch.device("cuda", local_rank)           # pin this process to its GPU
@@ -146,7 +148,7 @@ if __name__ == "__main__":
     device_mesh = init_device_mesh("cuda", (_world_size,))
 
     _rank = device_mesh.get_rank()
-    print(f"Starting PyTorch Sequence Parallel example on rank {_rank}.")
+    logger.info(f"Starting PyTorch Sequence Parallel example on rank {_rank}.")
     rank_log(_rank, logger, f"Device Mesh created: {device_mesh=}")
 
     in_features = 256
@@ -158,7 +160,7 @@ if __name__ == "__main__":
     ).to(device)
 
     # Custom parallelization plan for the model
-    print("parallelizing module..")
+    logger.info("parallelizing module..")
     sp_model = parallelize_module(
         module=model,
         device_mesh=device_mesh,
@@ -200,7 +202,7 @@ if __name__ == "__main__":
     # Create a optimizer for the parallelized module.
     lr = 0.25
     #optimizer = torch.optim.AdamW(sp_model.parameters(), lr=lr, foreach=True)
-    print("optimizer initialized")
+    logger.info("optimizer initialized")
 
 
     # Perform a num of iterations of forward/backward
@@ -218,6 +220,6 @@ if __name__ == "__main__":
         inp_local = torch.rand(32, 512 // device_mesh.size(), 256).to(device)  # Don't forget to move to device
         
         output = sp_model(inp_local)
-        print("step complete..")
+        logger.info("step complete..")
         output.sum().backward()
         #optimizer.step()

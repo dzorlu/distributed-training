@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ..logging import logger
 
 
 @dataclass
@@ -112,12 +113,12 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(args))
         self.norm = nn.LayerNorm(args.dim)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-        print(f"Transformer model initialized with {args.n_layers} layers")
-        print(f"Transformer model initialized with {args.dim} dimensions")
-        print(f"Transformer model initialized with {args.n_heads} heads")
-        print(f"Transformer model initialized with {args.dropout_p} dropout")
-        print(f"Transformer model initialized with {args.vocab_size} vocabulary size")
-        print(f"Transformer model initialized with {args.max_seq_len} max sequence length")
+        logger.info(f"Transformer model initialized with {args.n_layers} layers")
+        logger.info(f"Transformer model initialized with {args.dim} dimensions")
+        logger.info(f"Transformer model initialized with {args.n_heads} heads")
+        logger.info(f"Transformer model initialized with {args.dropout_p} dropout")
+        logger.info(f"Transformer model initialized with {args.vocab_size} vocabulary size")
+        logger.info(f"Transformer model initialized with {args.max_seq_len} max sequence length")
 
     def forward(self, tokens):
         _bsz, seq_len = tokens.size()

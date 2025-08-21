@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from ..logging import logger, init_logger
 
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
@@ -42,7 +43,7 @@ class Trainer:
         self.epochs_run = 0
         self.snapshot_path = snapshot_path
         if os.path.exists(snapshot_path):
-            print("Loading snapshot")
+            logger.info("Loading snapshot")
             self._load_snapshot(snapshot_path)
 
         self.model = DDP(self.model, device_ids=[self.gpu_id])
@@ -50,11 +51,11 @@ class Trainer:
     def _load_snapshot(self, snapshot_path):
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        print(f"Loading snapshot from {snapshot_path}")
-        print(snapshot.keys())
+        logger.info(f"Loading snapshot from {snapshot_path}")
+        logger.info(snapshot.keys())
         self.model.load_state_dict(snapshot["MODEL_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
-        print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
+        logger.info(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
     def _run_batch(self, source, targets):
         self.optimizer.zero_grad()
@@ -65,7 +66,7 @@ class Trainer:
 
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+        logger.info(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
         for source, targets in self.train_data:
             source = source.to(self.gpu_id)
@@ -78,7 +79,7 @@ class Trainer:
             "EPOCHS_RUN": epoch,
         }
         torch.save(snapshot, self.snapshot_path)
-        print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
+        logger.info(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
 
     def train(self, max_epochs: int):
         for epoch in range(self.epochs_run, max_epochs):
@@ -106,6 +107,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 
 def main(save_every: int, total_epochs: int, batch_size: int, snapshot_path: str = "snapshot.pt"):
     ddp_setup()
+    init_logger()
     dataset, model, optimizer = load_train_objs()
     train_data = prepare_dataloader(dataset, batch_size)
     trainer = Trainer(model, train_data, optimizer, save_every, snapshot_path)

@@ -25,6 +25,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+from .logging import logger
 
 
 # # 4. FeedForward module needs input redistribution
@@ -55,7 +56,7 @@ class ExpertParallel(ParallelStyle):
                     param, device_mesh, [Shard(0)]
                 )
             )
-            print(f"{name=}")
+            logger.info(f"{name=}")
             module.register_parameter(name, dist_param)
 
     def _partition_2d_fn(self, name, module, device_mesh):
@@ -68,13 +69,15 @@ class ExpertParallel(ParallelStyle):
                 _shard = [Shard(0), Shard(2)]
             else:
                 _shard = [Shard(0), Shard(2)]
+            
+            logger.info(f"sharding {name=} {_shard=}")
         
             dist_param = nn.Parameter(
                 distribute_tensor(
                     param, device_mesh, _shard
                 )
             )
-            print(f"{name=}")
+            logger.info(f"2d partition {name=}")
             module.register_parameter(name, dist_param)
 
 
@@ -142,7 +145,7 @@ class ExpertParallel(ParallelStyle):
         #   but is grouped by source GPU, not by expert ID. It needs a local shuffle.
 
         # all_to_all_single_autograd allows differentiable data transfer
-        print(f"{self.output_splits=} {self.input_splits=}")
+        logger.info(f"{self.output_splits=} {self.input_splits=}")
 
         x_gathered = all_to_all_single_autograd(
             x_gathered,

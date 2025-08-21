@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 from functools import wraps
+from ..logging import logger
 
 
 def find_free_port():
@@ -38,7 +39,11 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
         def wrapper(*args, **kwargs):
             # Check if we're already in a distributed process
             if "LOCAL_RANK" in os.environ:
+                # In a worker process, just run the user's function
+                # The logger will be initialized by the main training script
                 return func(*args, **kwargs)
+
+            # --- This section runs on the head node before launching workers ---
             
             # Single GPU case - no coordination needed
             if num_nodes == 1 and gpus_per_node == 1:
@@ -64,17 +69,17 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
             # We need to get the actual module name from __spec__
             if func.__module__ == '__main__':
                 main_module = sys.modules['__main__']
-                print(f"spec: {main_module.__spec__}")
+                logger.info(f"spec: {main_module.__spec__}")
                 module_name = main_module.__spec__.name
             else:
                 module_name = func.__module__
             
-            print(f"🚀 Launching distributed training:")
-            print(f"   Nodes: {num_nodes}")
-            print(f"   GPUs per node: {gpus_per_node}")
-            print(f"   Total processes: {num_nodes * gpus_per_node}")
-            print(f"   Master: {master_addr}:{master_port}")
-            print(f"   Module: {module_name}")
+            logger.info(f"🚀 Launching distributed training:")
+            logger.info(f"   Nodes: {num_nodes}")
+            logger.info(f"   GPUs per node: {gpus_per_node}")
+            logger.info(f"   Total processes: {num_nodes * gpus_per_node}")
+            logger.info(f"   Master: {master_addr}:{master_port}")
+            logger.info(f"   Module: {module_name}")
             
             @ray.remote(num_gpus=gpus_per_node, max_restarts=1)
             class NodeRunner:
@@ -93,15 +98,15 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
                         "-m", module_name
                     ] + args
                     
-                    print(f"Node {self.node_rank}: {' '.join(cmd)}")
+                    logger.info(f"Node {self.node_rank}: {' '.join(cmd)}")
                     
                     try:
                         # Run without capturing output so we can see training progress in real-time
                         result = subprocess.run(cmd, check=True)
-                        print(f"✅ Node {self.node_rank} completed successfully")
+                        logger.info(f"✅ Node {self.node_rank} completed successfully")
                         return result
                     except subprocess.CalledProcessError as e:
-                        print(f"❌ Node {self.node_rank} failed with exit code {e.returncode}")
+                        logger.error(f"❌ Node {self.node_rank} failed with exit code {e.returncode}")
                         raise
             
             # Create runners for each node
@@ -119,10 +124,10 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
             try:
                 # Wait for all nodes to complete
                 results = ray.get(futures)
-                print("✅ Distributed training completed successfully!")
+                logger.info("✅ Distributed training completed successfully!")
                 return results
             except Exception as e:
-                print(f"❌ Distributed training failed: {e}")
+                logger.error(f"❌ Distributed training failed: {e}")
                 raise
             
         return wrapper
@@ -148,7 +153,7 @@ if __name__ == "__main__":
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
         
-        print(f"Process {rank}/{world_size}, local rank {local_rank}, device {device}")
+        logger.info(f"Process {rank}/{world_size}, local rank {local_rank}, device {device}")
         
         # Your training code here...
         

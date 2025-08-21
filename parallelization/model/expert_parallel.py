@@ -25,6 +25,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+from ..logging import logger
 
 
 # # 4. FeedForward module needs input redistribution
@@ -55,7 +56,7 @@ class ExpertParallel(ParallelStyle):
                     param, device_mesh, [Shard(0)]
                 )
             )
-            print(f"{name=}")
+            logger.info(f"{name=}")
             module.register_parameter(name, dist_param)
 
     def _partition_2d_fn(self, name, module, device_mesh):
@@ -63,21 +64,27 @@ class ExpertParallel(ParallelStyle):
         Applies to TP + EP
         The weights are 3D (num_experts, dim, hidden_dim)
         """
+        # The TP applies to Shard(2).
+        # This is confusing, because in ColwiseParallel it appleis to Shard(0).
+        # https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/style.py#L125C41-L125C51
+        # We use bmm and need to make sure that ColwiseParallel applies to outer dimension.
+        # https://github.com/tgale96/grouped_gemm/blob/main/benchmark.py
+        
         module.register_parameter(
             "w1",
-            nn.Parameter(distribute_tensor(module.w1, device_mesh, [Shard(0), Shard(1)])),
+            nn.Parameter(distribute_tensor(module.w1, device_mesh, [Shard(0), Shard(2)])),
         )  # Column-wise sharding
 
         # w2 shape = (experts, in_dim, out_dim)
         module.register_parameter(
             "w2",
-            nn.Parameter(distribute_tensor(module.w2, device_mesh, [Shard(0), Shard(2)])),
+            nn.Parameter(distribute_tensor(module.w2, device_mesh, [Shard(0), Shard(1)])),
         )  # Row-wise sharding
 
         # w3 shape = (experts, out_dim, in_dim)
         module.register_parameter(
             "w3",
-            nn.Parameter(distribute_tensor(module.w3, device_mesh, [Shard(0), Shard(1)])),
+            nn.Parameter(distribute_tensor(module.w3, device_mesh, [Shard(0), Shard(2)])),
         )  # Column-wise sharding
 
 
@@ -86,7 +93,9 @@ class ExpertParallel(ParallelStyle):
             All-to-all communication
             input_splits is different coming from each device (assuming some data parallelism)
         """
-        ep_size = device_mesh.shape[0]
+        ep_group = device_mesh.get_group("ep")
+        ep_size = ep_group.size()
+
         x_gathered, num_tokens_per_expert = inputs
         num_tokens_per_expert_group = num_tokens_per_expert.new_empty(
             num_tokens_per_expert.shape[0]
@@ -110,7 +119,7 @@ class ExpertParallel(ParallelStyle):
         dist.all_to_all_single(
             num_tokens_per_expert_group, # output!
             num_tokens_per_expert, # input
-            group=device_mesh.get_all_groups(),
+            group=ep_group,
         )
 
         input_splits = num_tokens_per_expert.view(
@@ -144,13 +153,13 @@ class ExpertParallel(ParallelStyle):
         #   but is grouped by source GPU, not by expert ID. It needs a local shuffle.
 
         # all_to_all_single_autograd allows differentiable data transfer
-        print(f"{self.output_splits=} {self.input_splits=}")
+        logger.info(f"{self.output_splits=} {self.input_splits=}")
 
         x_gathered = all_to_all_single_autograd(
             x_gathered,
             self.output_splits,
             self.input_splits,
-            device_mesh.get_group(),
+            ep_group,
         )
 
         # num_tokens_per_expert_group
@@ -228,6 +237,9 @@ class ExpertParallel(ParallelStyle):
             Reverse the _token_dispatch operation.
             All-to-all to combine the output
         """
+        ep_group = device_mesh.get_group("ep")
+        ep_size = ep_group.size()
+
         reverse_ix = self.index.argsort()
         routed_output = routed_output[reverse_ix,:]
 
@@ -236,7 +248,7 @@ class ExpertParallel(ParallelStyle):
             routed_output,
             self.input_splits,
             self.output_splits,
-            device_mesh.get_group()
+            ep_group,
         )
 
         return routed_output
@@ -247,7 +259,6 @@ class ExpertParallel(ParallelStyle):
             _partition_fn = self._partition_2d_fn
         else:
             _partition_fn = self._partition_fn
-        print(f"{device_mesh=} {_partition_fn=}")
 
         return distribute_module(
             module,

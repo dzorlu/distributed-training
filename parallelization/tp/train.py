@@ -9,6 +9,7 @@ import re
 from parallelization import ray_distributed, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
 from parallelization.profiler.utils import log_parameter_count
+from ..logging import logger, init_logger
 
 
 import torch
@@ -47,17 +48,17 @@ def extract_unique_param_names(model):
     return unique_patterns
 
 def main(args):
-
+    init_logger()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)   # set by torchrun
     device = torch.device("cuda", local_rank)   
-    print(f"device: {device}")        # pin this process to its GPU
+    logger.info(f"device: {device}")        # pin this process to its GPU
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     tp_size = 2
     if args.fsdp_enable:
         dp_size = world_size // tp_size
-        print(f"{device=}, {dp_size=}, {tp_size=}")
+        logger.info(f"{device=}, {dp_size=}, {tp_size=}")
         device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp"))
         tp_mesh = device_mesh["tp"]
         # to ensure TP gets the same data.
@@ -72,13 +73,14 @@ def main(args):
 
 
     model_args = ModelArgs()
-    model = Transformer.from_model_args(model_args)
+    with torch.device("meta"):
+        model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
     model.init_weights()
 
 
     param_names = extract_unique_param_names(model)
-    print(param_names)
+    logger.info(param_names)
 
 
     tp_plan = {
@@ -170,7 +172,7 @@ def main(args):
         model = fully_shard(model, mesh=dp_mesh)
 
 
-    print("=== Parameter Analysis ===")
+    logger.info("=== Parameter Analysis ===")
     regular_tensors = []
     dtensors = []
 
@@ -180,12 +182,12 @@ def main(args):
         else:  # Regular tensor
             regular_tensors.append(name)
             
-    print(f"DTensors: {len(dtensors)}")
-    print(f"Regular tensors: {len(regular_tensors)}")
+    logger.info(f"DTensors: {len(dtensors)}")
+    logger.info(f"Regular tensors: {len(regular_tensors)}")
     if regular_tensors:
-        print("Regular tensor parameters:")
+        logger.info("Regular tensor parameters:")
         for name in regular_tensors:
-            print(f"  {name}")
+            logger.info(f"  {name}")
 
     model = model.to(device) # need to do this still.
 

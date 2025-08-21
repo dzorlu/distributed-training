@@ -12,6 +12,7 @@ from .utils import inspect_mixed_precision, inspect_model
 # Import the ray and profiler decorators
 from parallelization import ray_distributed, profiler, flop_counter
 from parallelization.profiler.decorator import step_profiler
+from ..logging import logger, init_logger
 
 
 
@@ -36,6 +37,7 @@ def set_modules_to_backward_prefetch(model, num_to_backward_prefetch):
 
 
 def main(args):
+    init_logger()
     rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -69,11 +71,11 @@ def main(args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     param_size_mb = total_params * 4 / (1024 * 1024)  # Assuming float32, 4 bytes per param
     
-    print(f"📊 Model Statistics:")
-    print(f"   🔢 Total parameters: {total_params:,}")
-    print(f"   🎯 Trainable parameters: {trainable_params:,}")
-    print(f"   💾 Model size: {param_size_mb:.2f} MB")
-    print(f"   🧮 Model config: dim={model_args.dim}, layers={model_args.n_layers}, heads={model_args.n_heads}")
+    logger.info(f"📊 Model Statistics:")
+    logger.info(f"   🔢 Total parameters: {total_params:,}")
+    logger.info(f"   🎯 Trainable parameters: {trainable_params:,}")
+    logger.info(f"   💾 Model size: {param_size_mb:.2f} MB")
+    logger.info(f"   🧮 Model config: dim={model_args.dim}, layers={model_args.n_layers}, heads={model_args.n_heads}")
 
     inspect_model(model)
 

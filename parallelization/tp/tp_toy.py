@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
+from ..logging import logger, init_logger
 
 from torch.distributed._tensor.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
@@ -70,38 +71,38 @@ class MHA(nn.Module):
         weight_q = self.q.weight  # This is the Linear module's weight (DTensor)
         
         # q.to_local() shows the LOCAL data this GPU holds
-        print(f"[Rank {rank}] Full local tensor q info: {q.to_local().shape}")
+        logger.info(f"[Rank {rank}] Full local tensor q info: {q.to_local().shape}")
         # Output: [32, 512, 2048] - each GPU has half the hidden_dim
         
         # weight.to_local() shows the LOCAL weight shard this GPU holds  
-        print(f"[Rank {rank}] Full local weight q info: {weight_q.to_local().shape}")
+        logger.info(f"[Rank {rank}] Full local weight q info: {weight_q.to_local().shape}")
         # Output: [2048, 4096] - each GPU has half the rows, all columns
         
-        print(f"[Rank {rank}] Placements q: {weight_q.placements}")
+        logger.info(f"[Rank {rank}] Placements q: {weight_q.placements}")
         # Output: (Shard(dim=0),) - confirms weight is sharded on dimension 0 (rows)
     
        # INSPECTING WEIGHTS AND OUTPUTS:
         weight_o = self.o.weight  # This is the Linear module's weight (DTensor)
         
         # q.to_local() shows the LOCAL data this GPU holds
-        print(f"[Rank {rank}] Full local tensor o info: {weight_o.to_local().shape}")
+        logger.info(f"[Rank {rank}] Full local tensor o info: {weight_o.to_local().shape}")
         # Output: [32, 512, 2048] - each GPU has half the hidden_dim
         
         # weight.to_local() shows the LOCAL weight shard this GPU holds  
-        print(f"[Rank {rank}] Full local weight o info: {weight_o.to_local().shape}")
+        logger.info(f"[Rank {rank}] Full local weight o info: {weight_o.to_local().shape}")
         # Output: [2048, 4096] - each GPU has half the rows, all columns
         
-        print(f"[Rank {rank}] Placements o: {weight_o.placements}")
+        logger.info(f"[Rank {rank}] Placements o: {weight_o.placements}")
         # Output: (Shard(dim=0),) - confirms weight is sharded on dimension 0 (rows)
 
-        print("after mapping")
+        logger.info("after mapping")
         
-        # DTensor print shows GLOBAL/LOGICAL view
-        print(f"[Rank {rank}] q shape: {q.shape} and type : {q.type()} on device {q.device}")
+        # DTensor logger.info shows GLOBAL/LOGICAL view
+        logger.info(f"[Rank {rank}] q shape: {q.shape} and type : {q.type()} on device {q.device}")
         # Output: shape [32, 512, 4096] - DTensor shows logical shape!
         
-        print(f"[Rank {rank}] k shape: {k.shape} and type : {k.type()} on device {k.device}")
-        print(f"[Rank {rank}] v shape: {v.shape} and type : {v.type()} on device {v.device}")
+        logger.info(f"[Rank {rank}] k shape: {k.shape} and type : {k.type()} on device {k.device}")
+        logger.info(f"[Rank {rank}] v shape: {v.shape} and type : {v.type()} on device {v.device}")
         
         # RESHAPING FOR MULTI-HEAD ATTENTION:
         # With use_local_output=False, DTensor handles distributed reshaping correctly
@@ -112,13 +113,13 @@ class MHA(nn.Module):
         k_trans = k.view(b, L, self.nb_heads, -1).transpose(1, 2)  # [32, 8, 512, 512]
         v_trans = v.view(b, L, self.nb_heads, -1).transpose(1, 2)  # [32, 8, 512, 512]
         
-        print("after reshape")
-        print(f"[Rank {rank}] q_trans shape: {q_trans.shape} and type : {q_trans.type()} on device {q_trans.device}")
+        logger.info("after reshape")
+        logger.info(f"[Rank {rank}] q_trans shape: {q_trans.shape} and type : {q_trans.type()} on device {q_trans.device}")
         # Output: [32, 8, 512, 512] - correct head_dim of 512!
         # Without use_local_output=False, this would be [32, 8, 512, 256] (wrong!)
         
-        print(f"[Rank {rank}] k_trans shape: {k_trans.shape} and type : {k_trans.type()} on device {k_trans.device}")
-        print(f"[Rank {rank}] v_trans shape: {v_trans.shape} and type : {v_trans.type()} on device {v_trans.device}")
+        logger.info(f"[Rank {rank}] k_trans shape: {k_trans.shape} and type : {k_trans.type()} on device {k_trans.device}")
+        logger.info(f"[Rank {rank}] v_trans shape: {v_trans.shape} and type : {v_trans.type()} on device {v_trans.device}")
 
         # ATTENTION COMPUTATION:
         att_scores = q_trans @ k_trans.transpose(-2, -1) / math.sqrt(self.head_dim)  # [32, 8, 512, 512]
@@ -131,13 +132,13 @@ class MHA(nn.Module):
             device_mesh=self.device_mesh,
             placements=[Replicate()]  # Mask is replicated across all GPUs
         )
-        print(f"mask dist init : {_full.type()} on device {v_trans.device}")
+        logger.info(f"mask dist init : {_full.type()} on device {v_trans.device}")
         _mask = torch.triu(_full, diagonal=1)
         att_scores = att_scores + _mask
         
         out = att_scores @ v_trans  # [32, 8, 512, 512]
         out = out.transpose(1,2).reshape(b, L, -1)  # [32, 512, 4096]
-        print(f"out shape: {out.shape} and type : {out.type()} on device {out.device}")
+        logger.info(f"out shape: {out.shape} and type : {out.type()} on device {out.device}")
         
         # FINAL PROJECTION WITH RowwiseParallel:
         # - self.o weight is sharded differently with RowwiseParallel
@@ -149,6 +150,7 @@ class MHA(nn.Module):
 
 
 if __name__ == "__main__":
+    init_logger()
     _world_size = int(os.environ["WORLD_SIZE"])
     device_type = torch.accelerator.current_accelerator().type
     device_mesh = init_device_mesh(device_type=device_type, mesh_shape=(_world_size,))
@@ -193,7 +195,7 @@ if __name__ == "__main__":
     lr = 0.25
     optimizer = torch.optim.AdamW(tp_model.parameters(), lr=lr, foreach=True)
 
-    print(tp_model)
+    logger.info(tp_model)
     
     num_iter = 10
     for i in range(num_iter):

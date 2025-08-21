@@ -116,12 +116,13 @@ moe_tp_plan = {
         input_layouts=(Shard(1),),  # From ffn_norm
         desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
         use_local_input=True,
-        use_local_output=True,
-        # this is effectively reduce-scatter
+        # use_local_output=True,
+        # input is effectively reduce-scatter
         # data out of moe layer is different across the devices, so
         # it has to be reduced then scattered for upcoming norm layer
-        # he _token_combine function handles the communication 
+        # the _token_combine function handles the communication 
         # for Expert Parallelism. 
+
         # The output_layouts=(Partial(),) 
         # and desired_output_layouts=(Shard(1),) 
         # handle the communication for Tensor Parallelism, 

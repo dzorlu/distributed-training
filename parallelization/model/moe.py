@@ -8,6 +8,7 @@ from torch.distributed.tensor import DTensor
 
 
 from .args import ModelArgs
+from ..logging import logger
 
 try:
     from grouped_gemm import ops
@@ -18,8 +19,6 @@ except ImportError:
 
 
 from torch.distributed.tensor.debug import visualize_sharding
-
-
 
 
 class Router(nn.Module):
@@ -198,7 +197,7 @@ class GroupedExpert(nn.Module):
         
         # MLP layers with activation
         # Expected batch_sizes.size(0) == num_experts
-        #print(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
+        #logger.info(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
         x1 = ops.gmm(x_bf16, w1_bf16, num_tokens_per_expert_cpu, trans_b=False)
         x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
         h = F.silu(x1) * x3
@@ -227,7 +226,7 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor):
         bsz, seq, dim = x.shape
-        print(f"{bsz=}, {seq=}, {dim=}")
+        #logger.info(f"{bsz=}, {seq=}, {dim=}")
         x_flat = x.reshape(-1, dim)
 
         # 1. Get routing plan, gathered tokens, and scores from the router.

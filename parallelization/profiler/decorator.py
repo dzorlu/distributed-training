@@ -4,6 +4,8 @@ import torch
 from functools import wraps
 from torch.profiler import profile, ProfilerActivity, schedule
 import torch.cuda.memory as _cm
+from ..logging import logger
+
 
 def flop_counter(model, enabled=True, step_to_measure=1):
     """
@@ -34,7 +36,7 @@ def flop_counter(model, enabled=True, step_to_measure=1):
                     #total_flops = sum(ftdm.flop_counts['Transformer'].values())  
                     total_flops = sum(ftdm.flop_counts['MoE'].values())                
                     tflops = total_flops / t_lapsed / 1e12
-                    print(f"rank {rank} step {step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
+                    logger.info(f"rank {rank} step {step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
                     return result
             else:
                 return func(*args, step_num=step_num, **kwargs)
@@ -47,23 +49,23 @@ def trace_handler(prof):
     
     # Only rank 0 prints summary to avoid spam
     if rank == 0:
-        print("\n📈 Profiling Summary:")
+        logger.info("\n📈 Profiling Summary:")
         output = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
-        print(output)
+        logger.info(output)
     
     # Each rank saves its own trace
     trace_path = f"/tmp/trace_rank_{rank}_step_{prof.step_num}.json"
     prof.export_chrome_trace(trace_path)
-    print(f"💾 Chrome trace saved to: {trace_path}")
+    logger.info(f"💾 Chrome trace saved to: {trace_path}")
 
     # ─── export memory timeline as a Perfetto‐readable counter track ───
     snap_path = f"/tmp/memory_snapshot_rank{rank}_step{prof.step_num}.pkl"
     _cm._dump_snapshot(snap_path)
-    print(f"💾 Memory timeline (Allocated vs Reserved) saved to: {snap_path}")
+    logger.info(f"💾 Memory timeline (Allocated vs Reserved) saved to: {snap_path}")
 
     # # Compute total FLOPs
     total_flops = sum(evt.flops for evt in prof.key_averages() if hasattr(evt, "flops"))
-    print(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}")
+    logger.info(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}")
 
 
 def profiler(
@@ -133,9 +135,9 @@ def profiler(
                 try:
                     # Start CUDA profiler APIs that NSight can capture
                     torch.cuda.cudart().cudaProfilerStart()
-                    print(f"🔍 NSight profiling enabled - output: {nsight_output}")
+                    logger.info(f"🔍 NSight profiling enabled - output: {nsight_output}")
                 except Exception as e:
-                    print(f"⚠️  NSight profiling failed to start: {e}")
+                    logger.warning(f"⚠️  NSight profiling failed to start: {e}")
 
             # ─── NEW: export memory timeline as a Perfetto‐readable counter track ───
             #CUDA allocator snapshot (_record_memory_history / _dump_snapshot) 
@@ -160,12 +162,12 @@ def profiler(
             )
             
             # === PROFILING STATUS DISPLAY ===
-            print(f"📊 PyTorch profiler enabled:")
-            print(f"   📁 Output directory: {output_dir}")
-            print(f"   ⏱️  Schedule - skip_first: {skip_first}, wait: {wait}, warmup: {warmup}, active: {active}, repeat: {repeat}")
-            print(f"   🔧 Options - stack: {with_stack}, flops: {with_flops}, modules: {with_modules}")
+            logger.info(f"📊 PyTorch profiler enabled:")
+            logger.info(f"   📁 Output directory: {output_dir}")
+            logger.info(f"   ⏱️  Schedule - skip_first: {skip_first}, wait: {wait}, warmup: {warmup}, active: {active}, repeat: {repeat}")
+            logger.info(f"   🔧 Options - stack: {with_stack}, flops: {with_flops}, modules: {with_modules}")
             if with_flops:
-                print(f"   💡 FLOP counting enabled - skipping first {skip_first} step(s) to avoid initialization overhead")
+                logger.info(f"   💡 FLOP counting enabled - skipping first {skip_first} step(s) to avoid initialization overhead")
             
             # === DISTRIBUTED TRAINING SUPPORT ===
             # Get rank information for multi-GPU setups
@@ -176,7 +178,7 @@ def profiler(
             # Create separate trace files for each GPU rank
             trace_filename = f"trace_rank_{rank}_{int(time.time())}.json"
             if world_size > 1:
-                print(f"🌐 Multi-GPU detected - saving rank {rank} trace to {trace_filename}")
+                logger.info(f"🌐 Multi-GPU detected - saving rank {rank} trace to {trace_filename}")
             
             # === MAIN PROFILING CONTEXT ===
             with profile(
@@ -207,18 +209,18 @@ def profiler(
             # === POST-PROCESSING: PRINT SUMMARY ===
             # Only rank 0 prints summary to avoid spam in multi-GPU setups
             if rank == 0:  
-                print("\n📈 Profiling Summary:")
+                logger.info("\n📈 Profiling Summary:")
                 # Show top 10 operations sorted by CUDA time
-                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+                logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
             
             # === NSIGHT CLEANUP ===
             # Stop NSight profiling if it was enabled
             if nsight_enabled:
                 try:
                     torch.cuda.cudart().cudaProfilerStop()
-                    print(f"✅ NSight profiling completed")
+                    logger.info(f"✅ NSight profiling completed")
                 except Exception as e:
-                    print(f"⚠️  NSight profiling failed to stop: {e}")
+                    logger.warning(f"⚠️  NSight profiling failed to stop: {e}")
             
             return result
             
