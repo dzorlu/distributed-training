@@ -122,6 +122,7 @@ class ExpertParallel(ParallelStyle):
             group=ep_group,
         )
 
+        logger.info(f"{num_tokens_per_expert=} {num_tokens_per_expert_group=}")
         input_splits = num_tokens_per_expert.view(
             ep_size, -1
         ).sum(dim=1).to(torch.device("cpu"))

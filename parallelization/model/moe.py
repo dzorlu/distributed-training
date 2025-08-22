@@ -179,6 +179,7 @@ class GroupedExpert(nn.Module):
         """
         # Move batch sizes to CPU
         num_tokens_per_expert_cpu = num_tokens_per_expert.to("cpu").to(torch.int64)
+        logger.info(f"{num_tokens_per_expert_cpu=}")
         
         # Convert to bfloat16 if needed (grouped_gemm supports it)
         x_bf16 = x.to(torch.bfloat16)

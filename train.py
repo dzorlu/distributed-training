@@ -10,6 +10,9 @@ from parallelization.profiler.decorator import step_profiler
 from parallelization.profiler.utils import log_parameter_count
 from parallelization.model.llama2_model import Transformer
 from parallelization.model.llama2_model import ModelArgs
+from parallelization.logging import logger, init_logger
+
+from parallelization.utils import device_type, device_module
 
 
 import torch
@@ -66,11 +69,12 @@ def extract_unique_param_names(model):
     return unique_patterns
 
 def main(args):
-
+    init_logger()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)   # set by torchrun
     device = torch.device("cuda", local_rank)
-    print(f"device: {device}")        # pin this process to its GPU
+    logger.info(f"device: {device}")
+    
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
@@ -92,7 +96,10 @@ def main(args):
 
 
     model_args = ModelArgs(use_moe=args.use_moe)
-    model = Transformer.from_model_args(model_args)
+    # This context allows you to define a model's architecture and a
+    # ll its parameters without allocating any memory for the weights, 
+    with torch.device("meta"):
+        model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
 
 
@@ -105,7 +112,7 @@ def main(args):
         rank=local_rank
     )
     
-    print("=== Parameter Analysis After Parallelization ===")
+    logger.info("=== Parameter Analysis After Parallelization ===")
     regular_tensors = []
     dtensors = []
 
@@ -115,14 +122,19 @@ def main(args):
         else:  # Regular tensor
             regular_tensors.append(name)
             
-    print(f"DTensors: {len(dtensors)}")
-    print(f"Regular tensors: {len(regular_tensors)}")
+    logger.info(f"DTensors: {len(dtensors)}")
+    logger.info(f"Regular tensors: {len(regular_tensors)}")
     if regular_tensors:
-        print(f"{device=} Regular tensor parameters:")
+        logger.info(f"{device=} Regular tensor parameters:")
         for name in regular_tensors:
-            print(f"{device=}, {name=}")
+            #print(f"{device=}, {name=}")
+            pass
 
-    model = model.to(device) # need to do this still.
+    model.to_empty(device=device)
+    # The weights are initialized directly on each target GPU
+    # after the model has been parallelized
+    with torch.no_grad():
+        model.init_weights()
 
     # foreach=False is not optimized.
     optimizer = Adam(model.parameters(), lr=0.25, foreach=False)
@@ -134,7 +146,6 @@ def main(args):
             # Fake forward pass for now
             loss = model(x).sum()
         if dist.get_rank() == 0:
-            print(f"------------- COMM DEBUG MODE: Step {step_num} -------------")
             comm_mode.log_comm_debug_tracing_table_to_file(file_name=f"comm_debug_{step_num}.txt")
         loss.backward()
         return loss
