@@ -64,6 +64,7 @@ setup: |
   python -m pip install -U "ray[data,train,tune,serve]"    # Ray docs recommend this for ML. 
   python -m pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main
   python -m pip install tabulate
+  python -m pip install transformers
   
   # Persist envs for interactive shells
   {

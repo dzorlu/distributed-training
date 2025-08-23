@@ -11,12 +11,14 @@ from parallelization.profiler.utils import log_parameter_count
 from parallelization.model.llama2_model import Transformer
 from parallelization.model.llama2_model import ModelArgs
 from parallelization.logging import logger, init_logger
+from transformers import AutoTokenizer
 
 from parallelization.utils import device_type, device_module
 
 
 import torch
-from torch.distributed.tensor.debug import CommDebugMode
+import torch.nn.functional as F
+import torch.distributed.tensor.debug as CommDebugMode
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.distributed.tensor.parallel import (
@@ -25,6 +27,8 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor import Shard, Replicate
 from torch.distributed.fsdp import fully_shard
 from torch.optim import Adam
+from transformers import AutoTokenizer
+from parallelization.dataset import get_hf_dataloader
 
 
 def apply_parallelization(
@@ -75,27 +79,32 @@ def main(args):
     device = torch.device("cuda", local_rank)
     logger.info(f"device: {device}")
     
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
+    dp_size = args.dp_size
+    tp_size = args.tp_size
+    
     if args.use_moe:
-        # 2D mesh for TP and EP
-        if args.tp_size * args.ep_size != world_size:
-            raise ValueError(f"World size {world_size} must be equal to tp_size * ep_size")
+        ep_size = args.ep_size
+        if tp_size * ep_size * dp_size != world_size:
+            raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size * ep_size")
         
         device_mesh = init_device_mesh(
             "cuda",
-            (args.ep_size, args.tp_size),
-            mesh_dim_names=("ep", "tp")
+            (dp_size, ep_size, tp_size),
+            mesh_dim_names=("dp", "ep", "tp")
         )
     else:
-        # 1D mesh for TP
-        if world_size != args.tp_size:
-            raise ValueError(f"World size {world_size} must be equal to tp_size {args.tp_size} for non-MoE models")
-        device_mesh = init_device_mesh("cuda", (args.tp_size,), mesh_dim_names=("tp",))
+        if dp_size * tp_size != world_size:
+            raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
+        device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
 
 
-    model_args = ModelArgs(use_moe=args.use_moe)
+    model_args = ModelArgs(use_moe=args.use_moe, vocab_size=tokenizer.vocab_size)
+    
     # This context allows you to define a model's architecture and a
     # ll its parameters without allocating any memory for the weights, 
     with torch.device("meta"):
@@ -140,11 +149,17 @@ def main(args):
     optimizer = Adam(model.parameters(), lr=0.25, foreach=False)
 
     @flop_counter(model, enabled=args.profile, step_to_measure=2)
-    def training_step(x, step_num=None):
+    def training_step(x, y, step_num=None):
         comm_mode = CommDebugMode()
         with comm_mode:
             # Fake forward pass for now
-            loss = model(x).sum()
+            logits = model(x)
+            # Reshape for cross-entropy loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                y.view(-1),
+                ignore_index=tokenizer.pad_token_id
+            )
         if dist.get_rank() == 0:
             comm_mode.log_comm_debug_tracing_table_to_file(file_name=f"comm_debug_{step_num}.txt")
         loss.backward()
@@ -152,12 +167,23 @@ def main(args):
 
     num_iter = 10
     batch_size = 2
-    seq_len = 128
-    for i in range(num_iter):
-        # seeding with rank to ensure identical inputs for TP groups
-        torch.manual_seed(i + dist.get_rank())
-        x = torch.randint(0, model_args.vocab_size, (batch_size, seq_len), device=device)
-        loss = training_step(x, step_num=i)
+
+    # --- Data Loading ---
+    dataloader = get_hf_dataloader(
+        dataset_name=args.dataset_name,
+        tokenizer=tokenizer,
+        model_args=model_args,
+        batch_size=batch_size,
+        device_mesh=device_mesh,
+    )
+
+    for i, batch in enumerate(dataloader):
+        if i >= num_iter:
+            break
+
+        x = batch['input_ids'].to(device, non_blocking=True)
+        y = batch['labels'].to(device, non_blocking=True)
+        loss = training_step(x, y, step_num=i)
         optimizer.step()
 
         # Step the profiler if profiling is enabled
@@ -171,9 +197,12 @@ if __name__ == "__main__":
     parser.add_argument("--use-moe", action="store_true", help="Whether to use MoE")
     parser.add_argument("--model-name", type=str, default="model", help="The name of the model folder under /parallelization")
     parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
+    parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--ep-size", type=int, default=2, help="Expert parallel size for MoE models")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
+    parser.add_argument("--tokenizer-name", type=str, default="meta-llama/Llama-2-7b-hf", help="The name of the tokenizer to use")
+    parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
