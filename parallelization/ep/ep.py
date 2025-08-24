@@ -25,19 +25,8 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
-from .logging import logger
 
-
-# # 4. FeedForward module needs input redistribution
-# # Feed forward layers
-# # return self.w2(F.silu(self.w1(x)) * self.w3(x))
-# "layers.*.feed_forward.w1": ColwiseParallel(),
-# "layers.*.feed_forward.w3": ColwiseParallel(),
-# # Reduce-scatter op here for norm operations. 
-# "layers.*.feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)), 
-
-
-
+from parallelization.logging import logger
 
 class ExpertParallel(ParallelStyle):
     def __init__(self):
@@ -45,41 +34,16 @@ class ExpertParallel(ParallelStyle):
         pass
 
     def _partition_fn(self, name, module, device_mesh):
-        """
-        Applies to EP
-        The weights are 3D (num_experts, dim, hidden_dim)
-        """
         # the weights are 3D (num_experts, dim, hidden_dim)
+        # partioning the experts only for simplicity (no TP in Experts)
         for name, param in module.named_parameters():
             dist_param = nn.Parameter(
                 distribute_tensor(
                     param, device_mesh, [Shard(0)]
                 )
             )
-            logger.info(f"{name=}")
+            print(f"{name=}")
             module.register_parameter(name, dist_param)
-
-    def _partition_2d_fn(self, name, module, device_mesh):
-        """
-        Applies to TP + EP
-        The weights are 3D (num_experts, dim, hidden_dim)
-        """
-        for name, param in module.named_parameters():
-            if 'w2' in name:
-                _shard = [Shard(0), Shard(2)]
-            else:
-                _shard = [Shard(0), Shard(2)]
-            
-            logger.info(f"sharding {name=} {_shard=}")
-        
-            dist_param = nn.Parameter(
-                distribute_tensor(
-                    param, device_mesh, _shard
-                )
-            )
-            logger.info(f"2d partition {name=}")
-            module.register_parameter(name, dist_param)
-
 
     def _token_dispatch(self, model, inputs, device_mesh):
         """
@@ -145,7 +109,7 @@ class ExpertParallel(ParallelStyle):
         #   but is grouped by source GPU, not by expert ID. It needs a local shuffle.
 
         # all_to_all_single_autograd allows differentiable data transfer
-        logger.info(f"{self.output_splits=} {self.input_splits=}")
+        print(f"{self.output_splits=} {self.input_splits=}")
 
         x_gathered = all_to_all_single_autograd(
             x_gathered,
@@ -244,11 +208,6 @@ class ExpertParallel(ParallelStyle):
 
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        if device_mesh.get('tp') and device_mesh.get('ep'):
-            _partition_fn = self._partition_2d_fn
-        else:
-            _partition_fn = self._partition_fn
-
         return distribute_module(
             module,
             device_mesh,
@@ -264,5 +223,11 @@ ep_plan = {
         desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
         #TODO: output layout / desired
     ),
+    # "layers.*.moe.router.router": None,
+    # pure expert parallelism. 
+    # weights are of shape 
+    # (model_args.num_experts, model_args.hidden_dim, model_args.dim)
+    # partioned weights are
+    # (model_args.num_experts // ep, model_args.hidden_dim, model_args.dim)
     "layers.*.moe.experts": ExpertParallel(),
 }

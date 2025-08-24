@@ -9,6 +9,8 @@ from .logging import logger
 
 def get_hf_dataloader(
     dataset_name: str,
+    dataset_config_name: Optional[str],
+    dataset_split: str,
     tokenizer: PreTrainedTokenizer,
     model_args: ModelArgs,
     batch_size: int,
@@ -20,8 +22,8 @@ def get_hf_dataloader(
     seq_len = model_args.max_seq_len
     dataset = load_dataset(
         dataset_name,
-        name=None, # Auto-selects config
-        split="train"
+        name=dataset_config_name,
+        split=dataset_split
     )
 
     if tokenizer.pad_token_id is None:
@@ -50,8 +52,8 @@ def get_hf_dataloader(
     )
 
     # Get DP rank and size from the device mesh
-    dp_rank = device_mesh.get_coordinate(dist.get_rank())[0]
-    dp_size = device_mesh.get_dim_size("dp")
+    dp_rank = device_mesh.get_coordinate()[0] # e.g., (0, 2)
+    dp_size = device_mesh.mesh.size(0)
 
     logger.info(f"{dp_rank=}, {dp_size=}")
 

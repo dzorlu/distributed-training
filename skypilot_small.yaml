@@ -21,6 +21,7 @@ workdir: .
 
 envs:
   WANDB_API_KEY: f66373399824f8c1942490b0862a664b8afc8802
+  HUGGING_FACE_HUB_TOKEN: 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
 
 file_mounts:
   /workspace/data:
@@ -64,12 +65,16 @@ setup: |
   python -m pip install -U "ray[data,train,tune,serve]"    # Ray docs recommend this for ML. 
   python -m pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main
   python -m pip install tabulate
-  python -m pip install transformers
+  python -m pip install transformers datasets huggingface-hub
+  
+  # Login to Hugging Face Hub non-interactively
+  hf auth login --token $HUGGING_FACE_HUB_TOKEN
   
   # Persist envs for interactive shells
   {
     echo 'export PATH="/usr/local/bin:/usr/bin:$PATH"'
     echo 'export WANDB_API_KEY='"$WANDB_API_KEY"
+    echo 'export HUGGING_FACE_HUB_TOKEN='"$HUGGING_FACE_HUB_TOKEN"
     echo 'export VLLM_USE_V1=1'
     echo 'export TORCH_NCCL_ASYNC_ERROR_HANDLING=1'
     echo 'export NCCL_DEBUG=INFO'
@@ -81,8 +86,10 @@ run: |
   export PATH="/usr/local/bin:/usr/bin:$PATH"
   
   export WANDB_API_KEY=f66373399824f8c1942490b0862a664b8afc8802
+  export HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
   export VLLM_USE_V1=1
   echo 'export WANDB_API_KEY=f66373399824f8c1942490b0862a664b8afc8802' >> ~/.bashrc
+  echo 'export HUGGING_FACE_HUB_TOKEN='"$HUGGING_FACE_HUB_TOKEN" >> ~/.bashrc
   echo 'export VLLM_USE_V1=1' >> ~/.bashrc
 
   cd /workspace/verl

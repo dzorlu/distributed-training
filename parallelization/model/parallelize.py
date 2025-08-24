@@ -11,6 +11,8 @@ from parallelization.profiler.decorator import step_profiler
 from parallelization.profiler.utils import log_parameter_count
 from .expert_parallel import ExpertParallel
 
+from parallelization.logging import logger
+
 
 
 import torch

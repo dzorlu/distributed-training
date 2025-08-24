@@ -4,5 +4,6 @@ from .profiler import profiler
 from .profiler.decorator import flop_counter
 from .ray_distributed import ray_distributed
 from .model import ModelArgs, Transformer
+from .logging import logger
 
-__all__ = ["ray_distributed", "profiler", "flop_counter", "ModelArgs", "Transformer"] 
+__all__ = ["ray_distributed", "profiler", "flop_counter", "ModelArgs", "Transformer", "logger"] 

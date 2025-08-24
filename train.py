@@ -18,7 +18,7 @@ from parallelization.utils import device_type, device_module
 
 import torch
 import torch.nn.functional as F
-import torch.distributed.tensor.debug as CommDebugMode
+from torch.distributed.tensor.debug import CommDebugMode
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.distributed.tensor.parallel import (
@@ -150,6 +150,7 @@ def main(args):
 
     @flop_counter(model, enabled=args.profile, step_to_measure=2)
     def training_step(x, y, step_num=None):
+        # https://docs.pytorch.org/tutorials/recipes/distributed_comm_debug_mode.html
         comm_mode = CommDebugMode()
         with comm_mode:
             # Fake forward pass for now
@@ -161,7 +162,11 @@ def main(args):
                 ignore_index=tokenizer.pad_token_id
             )
         if dist.get_rank() == 0:
-            comm_mode.log_comm_debug_tracing_table_to_file(file_name=f"comm_debug_{step_num}.txt")
+            comm_mode.log_comm_debug_tracing_table_to_file(
+                noise_level=1,
+                file_name=f"comm_debug_{step_num}.txt"
+                )
+            comm_mode.generate_json_dump(noise_level=2)
         loss.backward()
         return loss
 
@@ -171,6 +176,8 @@ def main(args):
     # --- Data Loading ---
     dataloader = get_hf_dataloader(
         dataset_name=args.dataset_name,
+        dataset_config_name=args.dataset_config_name,
+        dataset_split=args.dataset_split,
         tokenizer=tokenizer,
         model_args=model_args,
         batch_size=batch_size,
@@ -201,8 +208,10 @@ if __name__ == "__main__":
     parser.add_argument("--ep-size", type=int, default=2, help="Expert parallel size for MoE models")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
-    parser.add_argument("--tokenizer-name", type=str, default="meta-llama/Llama-2-7b-hf", help="The name of the tokenizer to use")
+    parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
     parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-config-name", type=str, default="wikitext-2-raw-v1", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")

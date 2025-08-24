@@ -25,7 +25,8 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
-from ..logging import logger
+
+from parallelization.logging import logger
 
 
 # # 4. FeedForward module needs input redistribution
@@ -67,7 +68,7 @@ class ExpertParallel(ParallelStyle):
         # The TP applies to Shard(2).
         # This is confusing, because in ColwiseParallel it appleis to Shard(0).
         # https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/style.py#L125C41-L125C51
-        # We use bmm and need to make sure that ColwiseParallel applies to outer dimension.
+        # but We use bmm and need to make sure that ColwiseParallel applies to outer dimension.
         # https://github.com/tgale96/grouped_gemm/blob/main/benchmark.py
         
         module.register_parameter(
@@ -256,11 +257,7 @@ class ExpertParallel(ParallelStyle):
 
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        if device_mesh['tp'] and device_mesh['ep']:
-            _partition_fn = self._partition_2d_fn
-        else:
-            _partition_fn = self._partition_fn
-
+        _partition_fn = self._partition_2d_fn
         return distribute_module(
             module,
             device_mesh,
