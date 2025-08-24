@@ -3,10 +3,11 @@ import argparse
 import os
 import re
 import importlib
+import wandb
 
 # Import the ray and profiler decorators
-from parallelization import ray_distributed, profiler, flop_counter
-from parallelization.profiler.decorator import step_profiler
+from parallelization import ray_distributed
+from parallelization.profiler.decorator import performance_monitor
 from parallelization.profiler.utils import log_parameter_count
 from parallelization.model.llama2_model import Transformer
 from parallelization.model.llama2_model import ModelArgs
@@ -102,6 +103,11 @@ def main(args):
             raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
         device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
 
+    rank = device_mesh.get_rank()
+    if args.wandb:
+        if rank == 0:
+            wandb.init(project="distributed-training")
+
 
     model_args = ModelArgs(use_moe=args.use_moe, vocab_size=tokenizer.vocab_size)
     
@@ -146,31 +152,28 @@ def main(args):
         model.init_weights()
 
     # foreach=False is not optimized.
-    optimizer = Adam(model.parameters(), lr=0.25, foreach=False)
+    optimizer = Adam(model.parameters(), lr=args.lr, foreach=False)
 
-    @flop_counter(model, enabled=args.profile, step_to_measure=2)
-    def training_step(x, y, step_num=None):
-        # https://docs.pytorch.org/tutorials/recipes/distributed_comm_debug_mode.html
-        comm_mode = CommDebugMode()
-        with comm_mode:
-            # Fake forward pass for now
-            logits = model(x)
-            # Reshape for cross-entropy loss
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                y.view(-1),
-                ignore_index=tokenizer.pad_token_id
-            )
-        if dist.get_rank() == 0:
-            comm_mode.log_comm_debug_tracing_table_to_file(
-                noise_level=1,
-                file_name=f"comm_debug_{step_num}.txt"
-                )
-            comm_mode.generate_json_dump(noise_level=2)
+    monitor = performance_monitor(
+        model,
+        enabled=args.profile,
+        flop_counter_step=2,
+        comm_logger_step=2,
+    )
+
+    @monitor
+    def training_step(x, y):
+        # Fake forward pass for now
+        logits = model(x)
+        # Reshape for cross-entropy loss
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), 
+            y.view(-1),
+            ignore_index=tokenizer.pad_token_id
+        )
         loss.backward()
         return loss
 
-    num_iter = 10
     batch_size = 2
 
     # --- Data Loading ---
@@ -185,17 +188,17 @@ def main(args):
     )
 
     for i, batch in enumerate(dataloader):
-        if i >= num_iter:
-            break
 
         x = batch['input_ids'].to(device, non_blocking=True)
         y = batch['labels'].to(device, non_blocking=True)
-        loss = training_step(x, y, step_num=i)
+        loss = training_step(x, y)
         optimizer.step()
 
-        # Step the profiler if profiling is enabled
-        step_profiler()
+        if args.wandb and rank == 0:
+            wandb.log({"loss": loss.item()})
 
+    if args.wandb and rank == 0:
+        wandb.finish()
     torch.distributed.destroy_process_group()
 
 
@@ -215,15 +218,15 @@ if __name__ == "__main__":
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Enable W&B logging by default (use --no-wandb to disable)")
+    
+    # Training arguments
+    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate for the optimizer")
+    
     args = parser.parse_args()
     
     # Apply decorators dynamically based on CLI args
     training_func = main
-    
-    # Apply profiler decorator if requested
-    if args.profile:
-        training_func = profiler(enabled=True)(training_func)
-    
     
     # Apply ray decorator for distributed training
     distributed_main = ray_distributed(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)

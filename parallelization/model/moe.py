@@ -9,6 +9,7 @@ from torch.distributed.tensor import DTensor
 
 from .args import ModelArgs
 from ..logging import logger
+import wandb
 
 try:
     from grouped_gemm import ops
@@ -153,35 +154,24 @@ class GroupedExpert(nn.Module):
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         """
-        Performs the forward pass for all experts on a packed tensor of tokens.
+        Forward pass for the expert layer.
 
-        
-        Performs the forward pass for all experts on a packed tensor of tokens.
-        
-        The tokens in x are ordered by expert assignment (all tokens for expert 0,
-        then all for expert 1, etc.), as prepared by the Router module.
-        
         Args:
-            x (torch.Tensor): Packed tensor of tokens ordered by expert assignment.
-                Shape: (batch_size * seq_len * top_k, hidden_dim)
+            x (torch.Tensor): Input tensor dispatched to this expert.
             num_tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert.
-                Shape: (num_experts,). Sum should equal batch_size * seq_len * top_k.
-        
-        Returns:
-            torch.Tensor: Expert outputs in the same packed format as input.
-                Shape: (batch_size * seq_len * top_k, hidden_dim)
-        
-        Computation flow:
-            x -> w1 -> SiLU ──┐
-                              ├─> * -> w2 -> out
-            x -> w3 ──────────┘
-
         """
-        # Move batch sizes to CPU
+        # Create a CPU copy for logging and operations that require it
         num_tokens_per_expert_cpu = num_tokens_per_expert.to("cpu").to(torch.int64)
         logger.info(f"{num_tokens_per_expert_cpu=}")
-        
-        # Convert to bfloat16 if needed (grouped_gemm supports it)
+
+        # Log to wandb if enabled
+        if wandb.run is not None:
+            # Create a dictionary for logging: {'expert_0': 4096, 'expert_1': 4096, ...}
+            token_dist = {f"expert_{i}": count.item() for i, count in enumerate(num_tokens_per_expert_cpu)}
+            wandb.log({"token_distribution": token_dist})
+
+        # --- Fused GMM Kernel ---
+        # The rest of the forward pass remains the same...
         x_bf16 = x.to(torch.bfloat16)
 
         if isinstance(self.w1, DTensor):

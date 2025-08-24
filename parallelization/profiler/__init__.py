@@ -1,3 +1,3 @@
-from .decorator import profiler
+from .decorator import performance_monitor
 
-__all__ = ["profiler"] 
+__all__ = ["performance_monitor"] 

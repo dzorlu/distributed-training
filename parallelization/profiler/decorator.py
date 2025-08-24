@@ -5,43 +5,176 @@ from functools import wraps
 from torch.profiler import profile, ProfilerActivity, schedule
 import torch.cuda.memory as _cm
 from ..logging import logger
+import wandb
+import torch.distributed as dist
+from torch.distributed.tensor.debug import CommDebugMode
 
 
-def flop_counter(model, enabled=True, step_to_measure=1):
+class performance_monitor:
     """
-    Simple FLOP counter decorator that wraps your existing logic.
-    
+    A unified decorator for PyTorch performance monitoring, combining the PyTorch
+    profiler, a FLOP counter, and a communication logger.
+
+    This decorator is stateful and designed to wrap a single training step function.
+    It manages the profiling lifecycle automatically.
+
     Usage:
-        @flop_counter(model, enabled=args.profile, step_to_measure=1)
-        def training_step(x, step_num):
-            loss = model(x).sum()
-            loss.backward()
-            return loss
+        monitor = performance_monitor(
+            model,
+            comm_mode=comm_mode_obj,
+            flop_counter_step=5,
+            comm_logger_step=2
+        )
+
+        @monitor
+        def train_step(batch):
+            # ... training logic ...
+
+        for batch in dataloader:
+            train_step(batch)
     """
-    def decorator(func):
+    def __init__(
+        self,
+        model,
+        comm_mode=None,
+        enabled=True,
+        output_dir="./profiler_logs",
+        skip_first=1,
+        wait=1,
+        warmup=1,
+        active=3,
+        repeat=1,
+        with_stack=False,
+        with_flops=True,
+        with_modules=False,
+        nsight_enabled=False,
+        nsight_output="nsight_profile",
+        flop_counter_step=None,
+        comm_logger_step=None,
+    ):
+        self.model = model
+        self.comm_mode = comm_mode
+        self.enabled = enabled
+        self.output_dir = output_dir
+        self.schedule_args = {
+            "skip_first": skip_first, "wait": wait, "warmup": warmup,
+            "active": active, "repeat": repeat
+        }
+        self.profiler_args = {
+            "with_stack": with_stack, "with_flops": with_flops, "with_modules": with_modules
+        }
+        self.nsight_enabled = nsight_enabled
+        self.nsight_output = nsight_output
+        self.flop_counter_step = flop_counter_step
+        self.comm_logger_step = comm_logger_step
+        self.comm_mode = CommDebugMode() if self.comm_logger_step is not None else None
+
+        self.prof = None
+        self.step_num = 0
+        self.rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    def _setup_profiler(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        if self.nsight_enabled:
+            try:
+                torch.cuda.cudart().cudaProfilerStart()
+                logger.info(f"🔍 NSight profiling enabled - output: {self.nsight_output}")
+            except Exception as e:
+                logger.warning(f"⚠️ NSight profiling failed to start: {e}")
+
+        _cm._record_memory_history()
+
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        profiler_schedule = schedule(**self.schedule_args)
+
+        logger.info(f"📊 PyTorch profiler enabled: {self.schedule_args}")
+
+        self.prof = profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            **self.profiler_args
+        )
+        self.prof.__enter__()
+
+    def __call__(self, func):
         @wraps(func)
-        def wrapper(*args, step_num=None, **kwargs):
-            if enabled and step_num == step_to_measure:
-                from torch.utils.flop_counter import FlopCounterMode
-                import time
-                
-                rank = int(os.environ.get("LOCAL_RANK", 0))
-                
-                with FlopCounterMode(mods=model, display=True, depth=None) as ftdm:
-                    t = time.time()
-                    result = func(*args, step_num=step_num, **kwargs)
-                    t_lapsed = time.time() - t
-                    # TODO: (dzorlu) grab the model name from the model
-                    #total_flops = sum(ftdm.flop_counts['FSDPTransformer'].values()) 
-                    #total_flops = sum(ftdm.flop_counts['Transformer'].values())  
-                    total_flops = sum(ftdm.flop_counts['MoE'].values())                
-                    tflops = total_flops / t_lapsed / 1e12
-                    logger.info(f"rank {rank} step {step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
-                    return result
+        def wrapper(*args, **kwargs):
+            if not self.enabled:
+                return func(*args, **kwargs)
+
+            if self.prof is None:
+                self._setup_profiler()
+
+            # Define how to run the user's training step, applying the comm_mode context if enabled
+            def execute_step():
+                if self.comm_mode:
+                    with self.comm_mode:
+                        return func(*args, **kwargs)
+                else:
+                    return func(*args, **kwargs)
+
+            # Flop counter logic (runs on a specific step)
+            if self.step_num == self.flop_counter_step:
+                result = self._run_flop_counter(execute_step)
             else:
-                return func(*args, step_num=step_num, **kwargs)
+                # Regular execution for other steps
+                result = execute_step()
+
+            # Communication logger logic (runs after the step)
+            if self.step_num == self.comm_logger_step:
+                self._run_comm_logger()
+            
+            self.prof.step()
+            self.step_num += 1
+            return result
         return wrapper
-    return decorator
+
+    def _run_flop_counter(self, execute_func):
+        from torch.utils.flop_counter import FlopCounterMode
+        logger.info(f"FLOP counter running for step {self.step_num}...")
+        with FlopCounterMode(mods=self.model, display=True, depth=None) as ftdm:
+            t = time.time()
+            result = execute_func()
+            t_lapsed = time.time() - t
+            
+            # Sum flops from all modules to be robust to model name changes
+            total_flops = sum(sum(m.values()) for m in ftdm.flop_counts.values())
+            tflops = total_flops / t_lapsed / 1e12 if t_lapsed > 0 else 0
+            logger.info(f"rank {self.rank} step {self.step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
+            if wandb.run is not None:
+                wandb.log({
+                    f"tflops_rank_{self.rank}": tflops,
+                    f"total_flops_rank_{self.rank}": total_flops,
+                    "step": self.step_num
+                })
+        return result
+
+    def _run_comm_logger(self):
+        if self.comm_mode and self.rank == 0 and dist.is_initialized():
+            logger.info(f"📝 Logging communication debug info for step {self.step_num}...")
+            try:
+                self.comm_mode.log_comm_debug_tracing_table_to_file(
+                    noise_level=1,
+                    file_name=f"comm_debug_{self.step_num}.txt"
+                )
+                self.comm_mode.generate_json_dump(noise_level=2)
+                logger.info("✅ Communication debug info saved.")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to log communication debug info: {e}")
+
+    def __del__(self):
+        if self.prof:
+            self.prof.__exit__(None, None, None)
+        if self.nsight_enabled:
+            try:
+                torch.cuda.cudart().cudaProfilerStop()
+                logger.info(f"✅ NSight profiling completed")
+            except Exception as e:
+                logger.warning(f"⚠️ NSight profiling failed to stop: {e}")
+
 
 def trace_handler(prof):
     # Get rank for distributed setups
@@ -52,6 +185,22 @@ def trace_handler(prof):
         logger.info("\n📈 Profiling Summary:")
         output = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
         logger.info(output)
+        if wandb.run is not None:
+            # Log top 10 events by cuda_time_total to W&B
+            profile_metrics = {}
+            for event in prof.key_averages(group_by_input_shape=True)[:10]:
+                metric_name = event.key.replace(" ", "_").replace("=", "").replace(",", "")
+                # Safely access attributes that may not be present (e.g., cuda_time_total on CPU-only events)
+                cuda_time_ms = getattr(event, 'cuda_time_total', 0) / 1000
+                cpu_time_ms = getattr(event, 'cpu_time_total', 0) / 1000
+                if cuda_time_ms > 0:
+                    profile_metrics[f"prof/{metric_name}/cuda_time_total_ms"] = cuda_time_ms
+                if cpu_time_ms > 0:
+                    profile_metrics[f"prof/{metric_name}/cpu_time_total_ms"] = cpu_time_ms
+            
+            wandb.log(profile_metrics)
+        else:
+            logger.warning("Wandb is not initialized")
     
     # Each rank saves its own trace
     trace_path = f"/tmp/trace_rank_{rank}_step_{prof.step_num}.json"
@@ -65,191 +214,4 @@ def trace_handler(prof):
 
     # # Compute total FLOPs
     total_flops = sum(evt.flops for evt in prof.key_averages() if hasattr(evt, "flops"))
-    logger.info(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}")
-
-
-def profiler(
-    enabled=True,
-    output_dir="./profiler_logs",
-    skip_first=1,
-    wait=1,
-    warmup=1, 
-    active=3,
-    repeat=1,
-    with_stack=True,
-    with_flops=True,
-    with_modules=True,
-    nsight_enabled=True,
-    nsight_output="nsight_profile"
-):
-    """
-    PyTorch profiler and NSight decorator for training functions.
-    
-    This decorator wraps training functions to automatically collect:
-    - CPU/GPU execution times for each operation
-    - Memory allocation/deallocation patterns
-    - FLOP (floating-point operations) counts
-    - Optional: Python stack traces and module hierarchy
-    - Optional: NSight Systems profiling data
-    
-    Args:
-        enabled: Whether to enable profiling (default: True)
-        output_dir: Directory to save profiling results (default: "./profiler_logs")
-        skip_first: Number of initial steps to skip (default: 1, avoids initialization overhead)
-        wait: Number of steps to wait before starting profiling (default: 1)
-        warmup: Number of warmup steps (default: 1)
-        active: Number of active profiling steps (default: 3)
-        repeat: Number of profiling cycles to repeat (default: 1)
-        with_stack: Include stack traces in profiling (default: False)
-        with_flops: Include FLOP counts (default: True, essential for performance analysis)
-        with_modules: Include module hierarchy (default: False)
-        nsight_enabled: Enable NSight profiling (default: False)
-        nsight_output: NSight output file prefix (default: "nsight_profile")
-    
-    Usage:
-        @profiler(enabled=True, with_flops=True, nsight_enabled=True)
-        def main(args):
-            # training logic here
-            
-        # Or combine with ray:
-        @ray(num_nodes=2, gpus_per_node=1)
-        @profiler(enabled=True, active=5)
-        def main(args):
-            # distributed training with profiling
-    """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # === EARLY EXIT IF PROFILING DISABLED ===
-            if not enabled:
-                return func(*args, **kwargs)
-            
-            # === SETUP OUTPUT DIRECTORY ===
-            # Create directory to store profiling results
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # === NSIGHT PROFILING SETUP ===
-            # NSight is NVIDIA's low-level GPU profiler
-            # It captures kernel execution, memory bandwidth, SM utilization
-            if nsight_enabled:
-                try:
-                    # Start CUDA profiler APIs that NSight can capture
-                    torch.cuda.cudart().cudaProfilerStart()
-                    logger.info(f"🔍 NSight profiling enabled - output: {nsight_output}")
-                except Exception as e:
-                    logger.warning(f"⚠️  NSight profiling failed to start: {e}")
-
-            # ─── NEW: export memory timeline as a Perfetto‐readable counter track ───
-            #CUDA allocator snapshot (_record_memory_history / _dump_snapshot) 
-            # will capture everything from when you invoked _record_memory_history() 
-            # up through the moment you call _dump_snapshot(), 
-            # regardless of the profiler schedule.
-            _cm._record_memory_history()
-
-            
-            # === PYTORCH PROFILER CONFIGURATION ===
-            # Configure what activities to profile
-            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-            
-            # Create profiling schedule - controls when profiling happens
-            # Schedule: [skip_first] → [wait] → [warmup] → [active] → repeat...
-            profiler_schedule = schedule(
-                skip_first=skip_first,  # Skip first N steps (avoids init overhead)
-                wait=wait,              # Wait N steps between cycles
-                warmup=warmup,          # Warmup N steps (profiler active but results discarded)
-                active=active,          # Active profiling for N steps (data collected)
-                repeat=repeat           # Repeat the cycle N times
-            )
-            
-            # === PROFILING STATUS DISPLAY ===
-            logger.info(f"📊 PyTorch profiler enabled:")
-            logger.info(f"   📁 Output directory: {output_dir}")
-            logger.info(f"   ⏱️  Schedule - skip_first: {skip_first}, wait: {wait}, warmup: {warmup}, active: {active}, repeat: {repeat}")
-            logger.info(f"   🔧 Options - stack: {with_stack}, flops: {with_flops}, modules: {with_modules}")
-            if with_flops:
-                logger.info(f"   💡 FLOP counting enabled - skipping first {skip_first} step(s) to avoid initialization overhead")
-            
-            # === DISTRIBUTED TRAINING SUPPORT ===
-            # Get rank information for multi-GPU setups
-            # Each GPU process gets a unique LOCAL_RANK (0, 1, 2, 3...)
-            rank = int(os.environ.get("LOCAL_RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            
-            # Create separate trace files for each GPU rank
-            trace_filename = f"trace_rank_{rank}_{int(time.time())}.json"
-            if world_size > 1:
-                logger.info(f"🌐 Multi-GPU detected - saving rank {rank} trace to {trace_filename}")
-            
-            # === MAIN PROFILING CONTEXT ===
-            with profile(
-                activities=activities,                    # What to profile (CPU + CUDA)
-                schedule=profiler_schedule,               # When to profile (skip/wait/warmup/active)
-                on_trace_ready=trace_handler,
-                record_shapes=True,                      # Record tensor shapes for each op
-                profile_memory=True,                     # Track memory allocations/deallocations
-                with_stack=with_stack,                   # Include Python stack traces (expensive)
-                with_flops=with_flops,                   # Count floating-point operations
-                with_modules=with_modules                # Include module hierarchy info
-            ) as prof:
-                
-                # === PROFILER STATE MANAGEMENT ===
-                # Store profiler globally so training loop can call prof.step()
-                # This allows the training loop to signal when each iteration completes
-                if hasattr(torch, '_current_profiler'):
-                    original_profiler = torch._current_profiler
-                else:
-                    original_profiler = None
-                
-                # Make profiler accessible to step_profiler() function
-                torch._current_profiler = prof
-                
-                # === RUN THE ACTUAL TRAINING FUNCTION ===
-                result = func(*args, **kwargs)
-            
-            # === POST-PROCESSING: PRINT SUMMARY ===
-            # Only rank 0 prints summary to avoid spam in multi-GPU setups
-            if rank == 0:  
-                logger.info("\n📈 Profiling Summary:")
-                # Show top 10 operations sorted by CUDA time
-                logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-            
-            # === NSIGHT CLEANUP ===
-            # Stop NSight profiling if it was enabled
-            if nsight_enabled:
-                try:
-                    torch.cuda.cudart().cudaProfilerStop()
-                    logger.info(f"✅ NSight profiling completed")
-                except Exception as e:
-                    logger.warning(f"⚠️  NSight profiling failed to stop: {e}")
-            
-            return result
-            
-        return wrapper
-    return decorator
-
-
-def step_profiler():
-    """
-    Helper function to step the profiler in training loops.
-    
-    This MUST be called at the end of each training step to:
-    1. Signal the profiler that one iteration has completed
-    2. Allow the profiler to advance through its schedule (wait/warmup/active phases)
-    3. Trigger trace collection when in active phase
-    
-    The profiler schedule only works if prof.step() is called regularly!
-    
-    Usage in training loop:
-        for batch in dataloader:
-            # Forward pass
-            loss = model(batch)
-            loss.backward()
-            optimizer.step()
-            
-            # CRITICAL: Tell profiler this step is done
-            step_profiler()
-    """
-    # Check if profiler is active (set by the decorator above)
-    if hasattr(torch, '_current_profiler') and torch._current_profiler is not None:
-        # Advance profiler to next step in schedule
-        torch._current_profiler.step() 
+    logger.info(f"\n💯 Total FLOPs (counted ops): {rank} {total_flops:,}") 
