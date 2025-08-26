@@ -103,6 +103,7 @@ def main(args):
             raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
         device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
 
+    logger.info(f"{device_mesh=}")
     rank = device_mesh.get_rank()
     if args.wandb:
         if rank == 0:

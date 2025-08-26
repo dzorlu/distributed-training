@@ -6,7 +6,7 @@ import re
 
 
 # Import the ray and profiler decorators
-from .expert_parallel import ExpertParallel
+from .expert_parallel import ExpertParallel, NoParallel
 from parallelization.logging import logger
 
 
@@ -111,15 +111,19 @@ ffn_plan = {
 moe_tp_plan = {
     # similar to FFN.
     "layers.*.feed_forward": PrepareModuleInputOutput(
-        input_layouts=(Shard(1),),  # From ffn_norm
-        desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
-        use_local_input=True,
-        # use_local_output=True,
         # input is effectively reduce-scatter
         # data out of moe layer is different across the devices, so
         # it has to be reduced then scattered for upcoming norm layer
         # the _token_combine function handles the communication 
         # for Expert Parallelism. 
+        input_layouts=(Shard(1),),  # From ffn_norm
+        desired_input_layouts=(Replicate(),),  # router need Replicate() - ALL-GATHER here
+
+
+        # bmm does not understand DTensor as it retrieves the dim and shapes.
+        # so we need to use local input so that gmm gets the correct shapes.
+        #use_local_input=True,
+        
 
         # The output_layouts=(Partial(),) 
         # and desired_output_layouts=(Shard(1),) 
@@ -134,8 +138,8 @@ moe_tp_plan = {
         output_layouts=(Partial(),),
         # back to norm
         desired_output_layouts=(Shard(1),),
-
     ),
+    "layers.*.feed_forward.router.router": NoParallel(),
 }
 
 
@@ -160,14 +164,25 @@ def parallelize(model: nn.Module, world_mesh: DeviceMesh, model_args: ModelArgs,
         # Moe layers are both EP/TP.
         # Manually apply ExpertParallel to bypass validation in parallelize_module
         # This includes token dispath and token gather modules at the boundaries.
+
+        # important: passing use_local_input=True because this is a different device mesh
+        # x coming from upstream is 1D and then it is 2D after router in EP. 
+        # (NodeRunner pid=19415) [rank1]: RuntimeError: DTensor does not support cross-mesh operation 
+        # on aten.mm.default! Got meshes: DeviceMesh('cuda', [0, 1], mesh_dim_names=('tp',)) 
+        # DeviceMesh('cuda', [[0, 1], [2, 3]], mesh_dim_names=('ep', 'tp')). 
+        # Please make sure all the arguments have the same DeviceMesh
+        # So, not using DTensor inside EP/TP region to circumvent the error.
+        # Alternatively, create a 2D mesh for the entire model so we can use DTensor (for later ;))
+
         expert_parallel_style = ExpertParallel()
+        
         for layer in model.layers:
             expert_parallel_style._apply(layer.feed_forward.experts, world_mesh['ep','tp'])
-
-        # moe input preparation goes into TP region.
+        
+        # moe input preparation goes into EP+TP region.
         parallelize_module(
             module=model,
-            device_mesh=tp_mesh,
+            device_mesh=world_mesh['tp'],
             parallelize_plan=moe_tp_plan,
         )
     else:

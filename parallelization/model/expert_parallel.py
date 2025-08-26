@@ -25,8 +25,10 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+from torch.distributed.tensor.parallel import parallelize_module as torch_parallelize_module
 
 from parallelization.logging import logger
+
 
 
 # # 4. FeedForward module needs input redistribution
@@ -38,7 +40,16 @@ from parallelization.logging import logger
 # "layers.*.feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)), 
 
 
-
+class NoParallel(ParallelStyle):
+    """
+    A ParallelStyle to replicate a module's parameters and computation
+    across a device mesh. This ensures weights are identical and gradients
+    are all-reduced during the backward pass.
+    """
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # Applying parallelize_module with no plan defaults to Replicate() for parameters
+        # https://github.com/pytorch/pytorch/blob/v2.8.0/torch/distributed/tensor/_api.py#L924
+        return distribute_module(module, device_mesh, partition_fn=None)
 
 class ExpertParallel(ParallelStyle):
     def __init__(self):
@@ -137,25 +148,25 @@ class ExpertParallel(ParallelStyle):
 
         # uneven communication
 
-        # On GPU 0:
+        # On EP Rank 0:
         # - Total tokens before send (sum of num_tokens_per_expert): 72
         # - input_splits (how to slice the 72 tokens for sending): [15, 20, 17, 20]
-        # - output_splits (how many tokens to expect from each GPU): [15, 13, 16, 14]
+        # - output_splits (how many tokens to expect from each rank): [15, 13, 16, 14]
 
         # Before all_to_all, each GPU has a different number of tokens and a different plan:
-        # GPU 0: tensor of size 72, sends chunks of [15, 20, 17, 20]
-        # GPU 1: (example) tensor of size 80, sends chunks of [13, 25, 22, 20]
-        # GPU 2: (example) tensor of size 75, sends chunks of [16, 18, 21, 20]
-        # GPU 3: (example) tensor of size 68, sends chunks of [14, 15, 19, 20]
+        # EP Rank 0: tensor of size 72, sends chunks of [15, 20, 17, 20]
+        # EP Rank 1: (example) tensor of size 80, sends chunks of [13, 25, 22, 20]
+        # EP Rank 2: (example) tensor of size 75, sends chunks of [16, 18, 21, 20]
+        # EP Rank 3: (example) tensor of size 68, sends chunks of [14, 15, 19, 20]
 
         # After all_to_all on GPU 0:
-        # - Receives: 15 from GPU0, 13 from GPU1, 16 from GPU2, 14 from GPU3
+        # - Receives: 15 from rank0, 13 from rank1, 16 from rank2, 14 from rank3
         # - Output tensor size = sum(output_splits) = 15 + 13 + 16 + 14 = 58
         # - This new tensor of 58 tokens contains data for GPU 0's local experts (E0, E1),
         #   but is grouped by source GPU, not by expert ID. It needs a local shuffle.
 
         # all_to_all_single_autograd allows differentiable data transfer
-        logger.info(f"{self.output_splits=} {self.input_splits=}")
+        logger.info(f"{self.output_splits=}")
 
         x_gathered = all_to_all_single_autograd(
             x_gathered,

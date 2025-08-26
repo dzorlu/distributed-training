@@ -1,39 +1,36 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 import logging
 import os
 import torch.distributed as dist
 
-
-logger = logging.getLogger()
-
+logger = logging.getLogger(__name__)
 
 class RankFilter(logging.Filter):
-    def filter(self, record):
-        rank = dist.get_rank() if dist.is_initialized() else 0
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Always attach a rank; do NOT filter anything out
+        try:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+        except Exception:
+            rank = -1
         record.rank = rank
-        if record.levelno == logging.INFO:
-            return rank == 0
-        return True
+        return True  # don't suppress any records
 
+def init_logger(level=logging.INFO):
+    # Clear existing handlers to avoid duplicate logs when re-initializing
+    logger.handlers.clear()
+    logger.propagate = False  # prevent double logging via root
 
-def init_logger():
-    # Clear existing handlers to avoid duplicate logs
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(level)
+
+    # Use %(rank)d instead of %(dist.get_rank())d
     formatter = logging.Formatter(
-        "[rank%(rank)d] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "[rank=%(rank)d pid=%(process)d] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     ch.setFormatter(formatter)
-    logger.addFilter(RankFilter())
+
+    # Attach filter that injects rank into every record
+    ch.addFilter(RankFilter())
     logger.addHandler(ch)
 
     # suppress verbose torch.profiler logging

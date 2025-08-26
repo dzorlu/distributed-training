@@ -72,5 +72,6 @@ def get_hf_dataloader(
         num_workers=2,
         pin_memory=True, # For faster CPU to GPU data transfer
     )
+    logger.info(f"{dataloader=}")
 
     return dataloader
