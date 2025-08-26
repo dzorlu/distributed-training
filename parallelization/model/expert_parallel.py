@@ -1,6 +1,7 @@
 
 from functools import partial
-from typing import Callable, Literal
+from typing import Callable, Literal, List
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -45,11 +46,66 @@ class NoParallel(ParallelStyle):
     A ParallelStyle to replicate a module's parameters and computation
     across a device mesh. This ensures weights are identical and gradients
     are all-reduced during the backward pass.
+
+    This operates sandwiched between local modes.
+    To ensure that router weights are identical across ranks, we need to convert the input to DTensor,
+    so that it is compatible with the DTensor operations.
     """
+    def __init__(self,
+        *,
+        input_layouts: Placement = Replicate(),
+        output_layouts: Placement = Replicate(),
+    ):
+        super().__init__()
+        self.use_local_output = True
+        self.input_layouts = input_layouts
+        self.desired_input_layouts = Replicate(),
+        self.output_layouts = output_layouts
+
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layouts, desired_input_layouts, mod, inputs, device_mesh
+    ):
+        """
+        Convert the input to DTensor and redistribute it to the desired layout.
+        """
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(input_tensor, device_mesh, (input_layouts,))
+        
+        if desired_input_layouts != input_layouts:
+            input_tensor = input_tensor.redistribute(
+                placements=(desired_input_layouts,), 
+                async_op=True)
+
+        return (input_tensor, *inputs[1:])
+        
+    
+    @staticmethod
+    def _prepare_output_fn(
+        output_layouts, mod, outputs, device_mesh
+    ):
+        """
+        Convert the output to local
+        """
+        if outputs.placements != (output_layouts,):
+            outputs = outputs.redistribute(placements=(output_layouts,), async_op=True)
+        return outputs.to_local() #local tensor
+        
+
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         # Applying parallelize_module with no plan defaults to Replicate() for parameters
         # https://github.com/pytorch/pytorch/blob/v2.8.0/torch/distributed/tensor/_api.py#L924
-        return distribute_module(module, device_mesh, partition_fn=None)
+        return distribute_module(
+            module, 
+            device_mesh, 
+            partition_fn=None,
+            input_fn=partial(
+                self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
+            ),
+            output_fn=partial(self._prepare_output_fn, self.output_layouts),
+        )
 
 class ExpertParallel(ParallelStyle):
     def __init__(self):
