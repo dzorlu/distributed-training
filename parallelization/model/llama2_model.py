@@ -413,7 +413,6 @@ class Transformer(nn.Module):
                 self.model_args.max_seq_len * 2,
             )
         nn.init.normal_(self.tok_embeddings.weight)
-        logger.info(f"tok_embeddings.weight sample after init: {self.tok_embeddings.weight[:10]}")
         for layer in self.layers:
             layer.init_weights()
         self.norm.reset_parameters()
@@ -439,10 +438,7 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
-        logger.info(f"tokens sample: {tokens[:10]}")
-        logger.info(f"tok_embeddings.weight sample before lookup: {self.tok_embeddings.weight}")
         h = self.tok_embeddings(tokens)
-        logger.info(f"h sample: {h[:10]}")
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
 

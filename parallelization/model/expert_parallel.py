@@ -70,7 +70,7 @@ class NoParallel(ParallelStyle):
         """
         Convert the input to DTensor and redistribute it to the desired layout.
         """
-        logger.info(f"{inputs=}")
+        logger.info(f"no parallel inputs {len(inputs)=}, {inputs[0].shape=}")
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(input_tensor, device_mesh, (input_layouts,))
@@ -90,9 +90,10 @@ class NoParallel(ParallelStyle):
         """
         Convert the output to local
         """
+        logger.info(f"no parallel outputs {len(outputs)=}, {outputs[0].shape=}")
         def _to_local(tensor):
             if isinstance(tensor, DTensor):
-                logger.info(f"Converting DTensor to local. Placements: {tensor.placements}, Shape: {tensor.shape}")
+                logger.info(f"Converting DTensor to local. {tensor.name} Placements: {tensor.placements}, Shape: {tensor.shape}")
                 if tensor.placements != (output_layouts,):
                     tensor = tensor.redistribute(placements=(output_layouts,))
                 return tensor.to_local()

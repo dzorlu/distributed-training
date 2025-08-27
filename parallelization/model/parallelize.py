@@ -122,7 +122,7 @@ moe_tp_plan = {
 
         # bmm does not understand DTensor as it retrieves the dim and shapes.
         # so we need to use local input so that gmm gets the correct shapes.
-        #use_local_input=True,
+        use_local_input=True,
         
 
         # The output_layouts=(Partial(),) 

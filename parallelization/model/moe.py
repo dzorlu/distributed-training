@@ -109,7 +109,7 @@ class Router(nn.Module):
         # Gather the actual token data from the token indices;
         # now x is replicated and in order
         # [b*s*top_k, h]
-        x_gathered = x.to_local()[scatter_indices]
+        x_gathered = x[scatter_indices]
         
         # Also reorder the scores to match the new token order.
         scores_sorted = top_scores.view(-1)[sorted_indices]
@@ -196,9 +196,7 @@ class GroupedExpert(nn.Module):
         x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
         h = F.silu(x1) * x3
         out = ops.gmm(h, w2_bf16, num_tokens_per_expert_cpu, trans_b=False)
-        
-        # Convert back to original dtype
-        # TODO: This needs to be recast to Dtype
+        logger.info(f"out shape: {out.shape} and dtype: {out.dtype} and type: {type(out)} and requires_grad: {out.requires_grad}")
         return out.to(x.dtype)
 
     def init_weights(self, init_std: float):
@@ -222,7 +220,6 @@ class MoE(nn.Module):
         bsz, seq, dim = x.shape
         #logger.info(f"{bsz=}, {seq=}, {dim=}")
         x_flat = x.reshape(-1, dim)
-        logger.info(f"x_flat sample: {x_flat[:10]}")
 
         # 1. Get routing plan, gathered tokens, and scores from the router.
         x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted = self.router(x_flat)
