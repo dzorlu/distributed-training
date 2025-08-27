@@ -169,6 +169,7 @@ def main(args):
             #print(f"{device=}, {name=}")
             pass
 
+    torch.distributed.barrier()
     model.to_empty(device=device)
     # The weights are initialized directly on each target GPU
     # after the model has been parallelized

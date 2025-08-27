@@ -414,6 +414,7 @@ class Transformer(nn.Module):
             )
         nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers:
+            logger.info(f"layer {layer.layer_id} init_weights")
             layer.init_weights()
         self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
