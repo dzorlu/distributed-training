@@ -119,7 +119,7 @@ class Router(nn.Module):
     def init_weights(self, init_std: float):
         with torch.random.fork_rng():
             torch.manual_seed(42)  # Same seed on all ranks
-            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std * 0.01)
+            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std)
 
 
 class GroupedExpert(nn.Module):
@@ -222,6 +222,7 @@ class MoE(nn.Module):
         bsz, seq, dim = x.shape
         #logger.info(f"{bsz=}, {seq=}, {dim=}")
         x_flat = x.reshape(-1, dim)
+        logger.info(f"x_flat sample: {x_flat[:10]}")
 
         # 1. Get routing plan, gathered tokens, and scores from the router.
         x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted = self.router(x_flat)
