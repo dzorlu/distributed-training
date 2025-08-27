@@ -139,7 +139,7 @@ moe_tp_plan = {
         # back to norm
         desired_output_layouts=(Shard(1),),
     ),
-    "layers.*.feed_forward.router.router": NoParallel(),
+    "layers.*.feed_forward.router": NoParallel(),
 }
 
 

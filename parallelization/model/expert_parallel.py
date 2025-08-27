@@ -59,7 +59,7 @@ class NoParallel(ParallelStyle):
         super().__init__()
         self.use_local_output = True
         self.input_layouts = input_layouts
-        self.desired_input_layouts = Replicate(),
+        self.desired_input_layouts = Replicate()
         self.output_layouts = output_layouts
 
 
