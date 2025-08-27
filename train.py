@@ -4,6 +4,7 @@ import os
 import re
 import importlib
 import wandb
+from datetime import timedelta
 
 # Import the ray and profiler decorators
 from parallelization import ray_distributed
@@ -17,6 +18,7 @@ from transformers import AutoTokenizer
 from parallelization.utils import device_type, device_module
 
 
+
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor.debug import CommDebugMode
@@ -25,6 +27,7 @@ from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor import Shard, Replicate
 from torch.distributed.fsdp import fully_shard
 from torch.optim import Adam
@@ -73,9 +76,29 @@ def extract_unique_param_names(model):
     
     return unique_patterns
 
+@record
 def main(args):
+    # Flight recorder setup via environment variables
+    os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "1"
+    os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "2000"
+    os.environ["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] = "/tmp/nccl_trace"
+    
     init_logger()
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    # Force re-initialization of the process group with a timeout.
+    # torchrun might initialize a default PG without a timeout.
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    
+    dist.init_process_group(
+        "nccl",
+        rank=local_rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60)
+    )
+
     torch.cuda.set_device(local_rank)   # set by torchrun
     device = torch.device("cuda", local_rank)
     logger.info(f"device: {device}")
@@ -149,8 +172,8 @@ def main(args):
     model.to_empty(device=device)
     # The weights are initialized directly on each target GPU
     # after the model has been parallelized
-    with torch.no_grad():
-        model.init_weights()
+    # with torch.no_grad():
+    #     model.init_weights()
 
     # foreach=False is not optimized.
     optimizer = Adam(model.parameters(), lr=args.lr, foreach=False)

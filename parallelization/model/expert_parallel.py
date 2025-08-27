@@ -70,14 +70,15 @@ class NoParallel(ParallelStyle):
         """
         Convert the input to DTensor and redistribute it to the desired layout.
         """
+        logger.info(f"{inputs=}")
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(input_tensor, device_mesh, (input_layouts,))
         
         if desired_input_layouts != input_layouts:
             input_tensor = input_tensor.redistribute(
-                placements=(desired_input_layouts,), 
-                async_op=True)
+                placements=(desired_input_layouts,)
+            )
 
         return (input_tensor, *inputs[1:])
         
@@ -89,10 +90,19 @@ class NoParallel(ParallelStyle):
         """
         Convert the output to local
         """
-        if outputs.placements != (output_layouts,):
-            outputs = outputs.redistribute(placements=(output_layouts,), async_op=True)
-        return outputs.to_local() #local tensor
-        
+        def _to_local(tensor):
+            if isinstance(tensor, DTensor):
+                logger.info(f"Converting DTensor to local. Placements: {tensor.placements}, Shape: {tensor.shape}")
+                if tensor.placements != (output_layouts,):
+                    tensor = tensor.redistribute(placements=(output_layouts,))
+                return tensor.to_local()
+            return tensor
+
+        if isinstance(outputs, tuple):
+            return tuple(_to_local(t) for t in outputs)
+        else:
+            return _to_local(outputs)
+
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         # Applying parallelize_module with no plan defaults to Replicate() for parameters

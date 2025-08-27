@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+import contextlib
 
 
 from .args import ModelArgs
@@ -108,7 +109,7 @@ class Router(nn.Module):
         # Gather the actual token data from the token indices;
         # now x is replicated and in order
         # [b*s*top_k, h]
-        x_gathered = x[scatter_indices]
+        x_gathered = x.to_local()[scatter_indices]
         
         # Also reorder the scores to match the new token order.
         scores_sorted = top_scores.view(-1)[sorted_indices]
@@ -116,7 +117,9 @@ class Router(nn.Module):
         return x_gathered, num_tokens_per_expert, scatter_indices, scores_sorted
 
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std)
+        with torch.random.fork_rng():
+            torch.manual_seed(42)  # Same seed on all ranks
+            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std * 0.01)
 
 
 class GroupedExpert(nn.Module):
