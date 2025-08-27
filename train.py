@@ -132,7 +132,7 @@ def main(args):
         if rank == 0:
             wandb.init(project="distributed-training")
 
-
+    logger.info(f"{tokenizer.vocab_size=}")
     model_args = ModelArgs(use_moe=args.use_moe, vocab_size=tokenizer.vocab_size)
     
     # This context allows you to define a model's architecture and a
@@ -172,8 +172,8 @@ def main(args):
     model.to_empty(device=device)
     # The weights are initialized directly on each target GPU
     # after the model has been parallelized
-    # with torch.no_grad():
-    #     model.init_weights()
+    with torch.no_grad():
+        model.init_weights()
 
     # foreach=False is not optimized.
     optimizer = Adam(model.parameters(), lr=args.lr, foreach=False)
@@ -189,12 +189,15 @@ def main(args):
     def training_step(x, y):
         # Fake forward pass for now
         logits = model(x)
+        logger.info(f"Logits shape: {logits.shape}, requires_grad: {logits.requires_grad}")
+        logger.info(f"{y.shape=}")
         # Reshape for cross-entropy loss
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), 
             y.view(-1),
             ignore_index=tokenizer.pad_token_id
         )
+        logger.info(f"Loss shape: {loss.shape}, requires_grad: {loss.requires_grad}, {loss=}")
         loss.backward()
         return loss
 
@@ -216,6 +219,7 @@ def main(args):
         x = batch['input_ids'].to(device, non_blocking=True)
         y = batch['labels'].to(device, non_blocking=True)
         loss = training_step(x, y)
+        
         optimizer.step()
 
         if args.wandb and rank == 0:
