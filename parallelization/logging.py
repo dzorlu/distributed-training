@@ -12,7 +12,7 @@ class RankFilter(logging.Filter):
         except Exception:
             rank = -1
         record.rank = rank
-        return True  # don't suppress any records
+        return rank == 0 
 
 def init_logger(level=logging.INFO):
     # Clear existing handlers to avoid duplicate logs when re-initializing

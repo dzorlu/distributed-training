@@ -19,8 +19,58 @@ except ImportError:
         "Grouped GEMM is not available. Please run `pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@main` (takes less than 5 minutes)"
     )
 
+from torch.distributed.tensor import DTensor
+
+def log_tensor(label: str, t):
+    if isinstance(t, DTensor):
+        tl = t.to_local()
+        try:
+            mesh = t.device_mesh
+        except Exception:
+            mesh = None
+        logger.info(
+            f"{label}: DTensor "
+            f"global_shape={tuple(t.shape)}, "
+            f"local_shape={tuple(tl.shape)}, "
+            f"placements={t.placements}, "
+            f"mesh={mesh}, "
+            f"local_dtype={tl.dtype}, "
+            f"local_device={tl.device}"
+        )
+    else:
+        logger.info(
+            f"{label}: Tensor "
+            f"shape={tuple(t.shape)}, "
+            f"dtype={t.dtype}, "
+            f"device={t.device}"
+        )
 
 from torch.distributed.tensor.debug import visualize_sharding
+
+
+def log_tensor(label: str, t):
+    if isinstance(t, DTensor):
+        tl = t.to_local()
+        try:
+            mesh = t.device_mesh
+        except Exception:
+            mesh = None
+        logger.info(
+            f"{label}: DTensor "
+            f"global_shape={tuple(t.shape)}, "
+            f"local_shape={tuple(tl.shape)}, "
+            f"placements={t.placements}, "
+            f"mesh={mesh}, "
+            f"local_dtype={tl.dtype}, "
+            f"local_device={tl.device}"
+        )
+    else:
+        logger.info(
+            f"{label}: Tensor "
+            f"shape={tuple(t.shape)}, "
+            f"dtype={t.dtype}, "
+            f"device={t.device}"
+        )
 
 
 class Router(nn.Module):
@@ -74,6 +124,9 @@ class Router(nn.Module):
         - Output `x_gathered`: Contains data `[x[0], x[2], x[1], x[3], x[0], x[3], x[1], x[2]]`
         """
         # [b*s, h] -> [b*s, num_experts]
+        log_tensor("x before router", x)
+        logger.info(f"is x dtensor: {isinstance(x, DTensor)}")
+
         expert_scores = self.router(x)
         
         # [b*s, num_experts], [b*s, num_experts]
@@ -109,6 +162,10 @@ class Router(nn.Module):
         # Gather the actual token data from the token indices;
         # now x is replicated and in order
         # [b*s*top_k, h]
+        #visualize_sharding(x)
+        log_tensor("x", x)
+        #visualize_sharding(scatter_indices)
+        log_tensor("scatter_indices", scatter_indices)
         x_gathered = x[scatter_indices]
         
         # Also reorder the scores to match the new token order.

@@ -1,0 +1,40 @@
+```
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| Component     | Weight Storage         | Forward Pass              | Backward Pass               | Memory per GPU    |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| Q projection  | ColwiseParallel + FSDP | fsdp.all_gather(W_shard) | fsdp.all_gather(W_shard)   | W[h/2, h/4]       |
+|               | GPU0: W[0:h/2, 0:h/4]  | W[h/2,h/4] → W[h,h/4]    | → W[h,h/4]                 | = 1/8 of full     |
+|               | GPU4: W[h/2:h, 0:h/4]  | X[B/2,s,h] @ W[h,h/4]    | Compute grad_W[h,h/4]      |                   |
+|               | (shard×TP split)       | → Q[B/2,s,h/4]           | fsdp.reduce_scatter(grad_W)|                   |
+|               |                        | Drop W → W[h/2,h/4]      | → grad_W_shard[h/2,h/4]    |                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| K projection  | ColwiseParallel + FSDP | fsdp.all_gather(W_shard) | fsdp.all_gather(W_shard)   | W[h/2, h/4]       |
+|               | GPU0: W[0:h/2, 0:h/4]  | W[h/2,h/4] → W[h,h/4]    | → W[h,h/4]                 | = 1/8 of full     |
+|               | GPU4: W[h/2:h, 0:h/4]  | X[B/2,s,h] @ W[h,h/4]    | Compute grad_W[h,h/4]      |                   |
+|               |                        | → K[B/2,s,h/4]           | fsdp.reduce_scatter(grad_W)|                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| V projection  | ColwiseParallel + FSDP | fsdp.all_gather(W_shard) | fsdp.all_gather(W_shard)   | W[h/2, h/4]       |
+|               | GPU0: W[0:h/2, 0:h/4]  | W[h/2,h/4] → W[h,h/4]    | → W[h,h/4]                 | = 1/8 of full     |
+|               | GPU4: W[h/2:h, 0:h/4]  | X[B/2,s,h] @ W[h,h/4]    | Compute grad_W[h,h/4]      |                   |
+|               |                        | → V[B/2,s,h/4]           | fsdp.reduce_scatter(grad_W)|                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| Attention ops | No weights             | No communication          | No communication            | -                 |
+|               |                        | Q,K,V[B/2,s,h/4]         | Local gradient compute      |                   |
+|               |                        | → attn[B/2,s,h/4]        |                                |                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| O projection  | RowwiseParallel + FSDP | fsdp.all_gather(W_shard) | fsdp.all_gather(W_shard)   | W[h/4, h/2]       |
+|               | GPU0: W[0:h/4, 0:h/2]  | W[h/4,h/2] → W[h/4,h]    | → W[h/4,h]                 | = 1/8 of full     |
+|               | GPU4: W[0:h/4, h/2:h]  | attn[B/2,s,h/4] @ W[h/4,h]| Compute grad_W[h/4,h]     |                   |
+|               |                        | → O_partial[B/2,s,h]     | fsdp.reduce_scatter(grad_W)|                   |
+|               |                        | tp.all_reduce(O_partial) | → grad_W_shard[h/4,h/2]    |                   |
+|               |                        | → O[B/2,s,h]             |                             |                   |
+|               |                        | Drop W → W[h/4,h/2]      |                             |                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| Input grad    | -                      | -                         | tp.all_reduce(dx_combined)  | -                 |
+|               |                        |                           | Combines Q,K,V input grads  |                   |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+| COMMS/block   | -                      | 4 fsdp.all_gather +      | 4 fsdp.all_gather +        | Weights: 12.5%    |
+|               |                        | 1 tp.all_reduce          | 4 fsdp.reduce_scatter +    | Batch: B/2        |
+|               |                        |                           | 1 tp.all_reduce            | (vs B in pure TP) |
++---------------+------------------------+---------------------------+-----------------------------+-------------------+
+```

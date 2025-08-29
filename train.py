@@ -16,6 +16,7 @@ from parallelization.logging import logger, init_logger
 from transformers import AutoTokenizer
 
 from parallelization.utils import device_type, device_module
+from torch._utils import _get_available_device_type, _get_device_module
 
 
 
@@ -34,6 +35,11 @@ from torch.optim import Adam
 from transformers import AutoTokenizer
 from parallelization.dataset import get_hf_dataloader
 
+def get_device_info() -> tuple[str, torch.device]:
+    device_type = _get_available_device_type() or "cuda"
+    device_module = _get_device_module(device_type)  # default device_module:torch.cuda
+    logger.info(f"device_type: {device_type}, device_module: {device_module}")
+    return device_type, device_module
 
 def apply_parallelization(
     model: torch.nn.Module,
@@ -80,28 +86,35 @@ def extract_unique_param_names(model):
 def main(args):
     # Flight recorder setup via environment variables
     os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "1"
-    os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "2000"
-    os.environ["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] = "/tmp/nccl_trace"
+    os.environ["TORCH_FR_BUFFER_SIZE"] = "2000"
+    os.environ["TORCH_FR_DUMP_TEMP_FILE"] = "/tmp/nccl_trace"
     
     init_logger()
+
     local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ.get("RANK", str(local_rank)))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    # Force re-initialization of the process group with a timeout.
-    # torchrun might initialize a default PG without a timeout.
+    device_type, device_module = get_device_info()
+    torch.cuda.set_device(local_rank)   # set by torchrun
+    device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+    # Device has to be set before creating TorchFT manager.
+    device_module.set_device(device)
+
+
+    logger.info(f"device: {device}")
+    logger.info(f"local_rank: {local_rank}, rank: {rank}, world_size: {world_size}")
+
+    # Initialize the default PG with an explicit device mapping
     if dist.is_initialized():
         dist.destroy_process_group()
-    
     dist.init_process_group(
-        "nccl",
-        rank=local_rank,
+        backend="nccl",
+        rank=rank,
         world_size=world_size,
-        timeout=timedelta(seconds=60)
+        timeout=timedelta(seconds=60),
+        device_id=local_rank,
     )
-
-    torch.cuda.set_device(local_rank)   # set by torchrun
-    device = torch.device("cuda", local_rank)
-    logger.info(f"device: {device}")
     
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
 
@@ -121,12 +134,16 @@ def main(args):
             (dp_size, ep_size, tp_size),
             mesh_dim_names=("dp", "ep", "tp")
         )
+        device_mesh['tp']
+        device_mesh['ep','tp']
     else:
         if dp_size * tp_size != world_size:
             raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
         device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
 
     logger.info(f"{device_mesh=}")
+    assert torch.cuda.current_device() == local_rank
+
     rank = device_mesh.get_rank()
     if args.wandb:
         if rank == 0:
@@ -166,14 +183,15 @@ def main(args):
     if regular_tensors:
         logger.info(f"{device=} Regular tensor parameters:")
         for name in regular_tensors:
-            #print(f"{device=}, {name=}")
+            print(f"{device=}, {name=}")
             pass
 
-    torch.distributed.barrier()
+    # logger.info(f"to_empty")
     model.to_empty(device=device)
     # The weights are initialized directly on each target GPU
     # after the model has been parallelized
     with torch.no_grad():
+        logger.info(f"init_weights")
         model.init_weights()
 
     # foreach=False is not optimized.
