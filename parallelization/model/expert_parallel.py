@@ -32,91 +32,83 @@ from parallelization.logging import logger
 
 
 
-# # 4. FeedForward module needs input redistribution
-# # Feed forward layers
-# # return self.w2(F.silu(self.w1(x)) * self.w3(x))
-# "layers.*.feed_forward.w1": ColwiseParallel(),
-# "layers.*.feed_forward.w3": ColwiseParallel(),
-# # Reduce-scatter op here for norm operations. 
-# "layers.*.feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)), 
+
+# class NoParallel(ParallelStyle):
+#     """
+#     A ParallelStyle to replicate a module's parameters and computation
+#     across a device mesh. This ensures weights are identical and gradients
+#     are all-reduced during the backward pass.
+
+#     This operates sandwiched between local modes.
+#     To ensure that router weights are identical across ranks, we need to convert the input to DTensor,
+#     so that it is compatible with the DTensor operations.
+#     """
+#     def __init__(self,
+#         *,
+#         input_layouts: Placement = Replicate(),
+#         output_layouts: Placement = Replicate(),
+#     ):
+#         super().__init__()
+#         self.use_local_output = True
+#         self.input_layouts = input_layouts
+#         self.desired_input_layouts = Replicate()
+#         self.output_layouts = output_layouts
 
 
-class NoParallel(ParallelStyle):
-    """
-    A ParallelStyle to replicate a module's parameters and computation
-    across a device mesh. This ensures weights are identical and gradients
-    are all-reduced during the backward pass.
-
-    This operates sandwiched between local modes.
-    To ensure that router weights are identical across ranks, we need to convert the input to DTensor,
-    so that it is compatible with the DTensor operations.
-    """
-    def __init__(self,
-        *,
-        input_layouts: Placement = Replicate(),
-        output_layouts: Placement = Replicate(),
-    ):
-        super().__init__()
-        self.use_local_output = True
-        self.input_layouts = input_layouts
-        self.desired_input_layouts = Replicate()
-        self.output_layouts = output_layouts
-
-
-    @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        """
-        Convert the input to DTensor and redistribute it to the desired layout.
-        """
-        logger.info(f"no parallel inputs {len(inputs)=}, {inputs[0].shape=}")
-        input_tensor = inputs[0]
-        if not isinstance(input_tensor, DTensor):
-            input_tensor = DTensor.from_local(input_tensor, device_mesh, (input_layouts,))
+#     @staticmethod
+#     def _prepare_input_fn(
+#         input_layouts, desired_input_layouts, mod, inputs, device_mesh
+#     ):
+#         """
+#         Convert the input to DTensor and redistribute it to the desired layout.
+#         """
+#         logger.info(f"no parallel inputs {len(inputs)=}, {inputs[0].shape=}")
+#         input_tensor = inputs[0]
+#         if not isinstance(input_tensor, DTensor):
+#             input_tensor = DTensor.from_local(input_tensor, device_mesh, (input_layouts,))
         
-        if desired_input_layouts != input_layouts:
-            input_tensor = input_tensor.redistribute(
-                placements=(desired_input_layouts,)
-            )
+#         if desired_input_layouts != input_layouts:
+#             input_tensor = input_tensor.redistribute(
+#                 placements=(desired_input_layouts,)
+#             )
 
-        return (input_tensor, *inputs[1:])
+#         return (input_tensor, *inputs[1:])
         
     
-    @staticmethod
-    def _prepare_output_fn(
-        output_layouts, mod, outputs, device_mesh
-    ):
-        """
-        Convert the output to local
-        """
-        logger.info(f"no parallel outputs {len(outputs)=}, {outputs[0].shape=}")
-        def _to_local(tensor):
-            if isinstance(tensor, DTensor):
-                logger.info(f"Converting DTensor to local. {tensor.name} Placements: {tensor.placements}, Shape: {tensor.shape}")
-                if tensor.placements != (output_layouts,):
-                    tensor = tensor.redistribute(placements=(output_layouts,))
-                return tensor.to_local()
-            return tensor
+#     @staticmethod
+#     def _prepare_output_fn(
+#         output_layouts, mod, outputs, device_mesh
+#     ):
+#         """
+#         Convert the output to local
+#         """
+#         logger.info(f"no parallel outputs {len(outputs)=}, {outputs[0].shape=}")
+#         def _to_local(tensor):
+#             if isinstance(tensor, DTensor):
+#                 logger.info(f"Converting DTensor to local. {tensor.name} Placements: {tensor.placements}, Shape: {tensor.shape}")
+#                 if tensor.placements != (output_layouts,):
+#                     tensor = tensor.redistribute(placements=(output_layouts,))
+#                 return tensor.to_local()
+#             return tensor
 
-        if isinstance(outputs, tuple):
-            return tuple(_to_local(t) for t in outputs)
-        else:
-            return _to_local(outputs)
+#         if isinstance(outputs, tuple):
+#             return tuple(_to_local(t) for t in outputs)
+#         else:
+#             return _to_local(outputs)
 
 
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        # Applying parallelize_module with no plan defaults to Replicate() for parameters
-        # https://github.com/pytorch/pytorch/blob/v2.8.0/torch/distributed/tensor/_api.py#L924
-        return distribute_module(
-            module, 
-            device_mesh, 
-            partition_fn=None,
-            input_fn=partial(
-                self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
-            ),
-            output_fn=partial(self._prepare_output_fn, self.output_layouts),
-        )
+#     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+#         # Applying parallelize_module with no plan defaults to Replicate() for parameters
+#         # https://github.com/pytorch/pytorch/blob/v2.8.0/torch/distributed/tensor/_api.py#L924
+#         return distribute_module(
+#             module, 
+#             device_mesh, 
+#             partition_fn=None,
+#             input_fn=partial(
+#                 self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
+#             ),
+#             output_fn=partial(self._prepare_output_fn, self.output_layouts),
+#         )
 
 class ExpertParallel(ParallelStyle):
     def __init__(self):
@@ -172,8 +164,9 @@ class ExpertParallel(ParallelStyle):
             All-to-all communication
             input_splits is different coming from each device (assuming some data parallelism)
         """
-        ep_group = device_mesh.get_group("ep")
+        ep_group = device_mesh.get_group("cols")
         ep_size = ep_group.size()
+        #logger.info(f"{describe_group(ep_group)=} {ep_size=}")
 
         x_gathered, num_tokens_per_expert = inputs
         num_tokens_per_expert_group = num_tokens_per_expert.new_empty(
@@ -317,8 +310,9 @@ class ExpertParallel(ParallelStyle):
             Reverse the _token_dispatch operation.
             All-to-all to combine the output
         """
-        ep_group = device_mesh.get_group("ep")
+        ep_group = device_mesh.get_group("cols")
         ep_size = ep_group.size()
+        #logger.info(f"{describe_group(ep_group)=} {ep_size=}")
 
         reverse_ix = self.index.argsort()
         routed_output = routed_output[reverse_ix,:]
@@ -335,7 +329,11 @@ class ExpertParallel(ParallelStyle):
 
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        _partition_fn = self._partition_2d_fn
+        if len(device_mesh.mesh_dim_names) == 2:
+            _partition_fn = self._partition_2d_fn
+        else:
+            _partition_fn = self._partition_fn
+
         return distribute_module(
             module,
             device_mesh,

@@ -13,13 +13,13 @@ def get_hf_dataloader(
     dataset_split: str,
     tokenizer: PreTrainedTokenizer,
     model_args: ModelArgs,
-    batch_size: int,
     device_mesh,
 ):
     """
     Creates a data-parallel-aware DataLoader from a Hugging Face dataset.
     """
     seq_len = model_args.max_seq_len
+    batch_size = model_args.batch_size
     dataset = load_dataset(
         dataset_name,
         name=dataset_config_name,

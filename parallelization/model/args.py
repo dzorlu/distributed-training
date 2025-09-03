@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+from torch.distributed.device_mesh import DeviceMesh
 
 @dataclass
 class ModelArgs:
@@ -12,14 +13,21 @@ class ModelArgs:
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
+    batch_size: int = 4
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 2024
     # If `True`, then each transfor
     # mer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
 
     # moe
-    num_experts: int = 8
+    num_experts: int = 4
     top_k: int = 2
-    use_moe: bool = False
+    use_moe: bool = True
+
+    # lr
+    lr: float = 0.00005
+
+    # device mesh
+    device_mesh: Optional[DeviceMesh] = None

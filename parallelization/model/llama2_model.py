@@ -218,8 +218,8 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use casual mask for training
-        logger.info(f"xq shape: {xq.shape}, xk shape: {xk.shape}, xv shape: {xv.shape}")
-        logger.info(f"xq type: {xq.type()}, xk type: {xk.type()}, xv type: {xv.type()}")
+        #logger.info(f"xq shape: {xq.shape}, xk shape: {xk.shape}, xv shape: {xv.shape}")
+        #logger.info(f"xq type: {xq.type()}, xk type: {xk.type()}, xv type: {xv.type()}")
         output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
         output = output.transpose(
             1, 2
@@ -296,8 +296,10 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
+        self.moe_enabled = False
         self.attention = Attention(model_args)
         if model_args.use_moe:
+            self.moe_enabled = True
             self.feed_forward = MoE(model_args=model_args)
         else:
             self.feed_forward = FeedForward(
@@ -373,7 +375,8 @@ class Transformer(nn.Module):
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
         self.model_dim = model_args.dim
-
+        logger.info(f"model_args: {model_args}")
+        logger.info(f"model_args.vocab_size: {model_args.vocab_size}")
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
         self.register_buffer(
             "freqs_cis",
@@ -416,7 +419,6 @@ class Transformer(nn.Module):
             )
         nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers:
-            logger.info(f"layer {layer.layer_id} init_weights")
             layer.init_weights()
         self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5

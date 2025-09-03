@@ -12,6 +12,7 @@ from parallelization.profiler.decorator import performance_monitor
 from parallelization.profiler.utils import log_parameter_count
 from parallelization.model.llama2_model import Transformer
 from parallelization.model.llama2_model import ModelArgs
+from parallelization.model.moe import GroupedExpert
 from parallelization.logging import logger, init_logger
 from transformers import AutoTokenizer
 
@@ -44,7 +45,7 @@ def get_device_info() -> tuple[str, torch.device]:
 def apply_parallelization(
     model: torch.nn.Module,
     model_name: str,
-    world_mesh: DeviceMesh,
+    mesh: DeviceMesh,
     model_args: ModelArgs,
     rank: int
 ):
@@ -54,7 +55,7 @@ def apply_parallelization(
         parallelize_module_import = importlib.import_module(module_path)
         parallelize_fn = getattr(parallelize_module_import, "parallelize")
         # This function will now apply the parallelization in-place on the model
-        parallelize_fn(model, world_mesh, model_args, rank)
+        parallelize_fn(model, mesh, model_args, rank)
     except (ModuleNotFoundError, AttributeError) as e:
         raise ImportError(f"Could not import or find 'parallelize' function in '{module_path}'. Make sure the module and function exist.") from e
 
@@ -122,24 +123,45 @@ def main(args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
     dp_size = args.dp_size
-    tp_size = args.tp_size
-    
+
     if args.use_moe:
         ep_size = args.ep_size
-        if tp_size * ep_size * dp_size != world_size:
-            raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size * ep_size")
-        
+        dp_shard = dp_size  # treat provided dp_size as the total DP sharding degree
+        if dp_shard % ep_size != 0:
+            raise ValueError(
+                f"EP must divide DP sharding: dp_shard({dp_shard}) % ep({ep_size}) == 0 required."
+            )
+
+        dp_shard_in_ep = ep_size                # borrowed by EP (forms EP groups)
+        dp_shard_mod_ep = dp_shard // ep_size   # leftover for FSDP sharding
+
+        # With only DP+EP (tp=cp=pp=1), the total WORLD_SIZE equals dp_shard
+        if dp_shard != world_size:
+            raise ValueError(
+                f"With DP2EP and tp=cp=pp=1, WORLD_SIZE({world_size}) must equal dp_shard({dp_shard})"
+            )
+
+        # Create the 2D mesh
         device_mesh = init_device_mesh(
             "cuda",
-            (dp_size, ep_size, tp_size),
-            mesh_dim_names=("dp", "ep", "tp")
+            (dp_shard_mod_ep, dp_shard_in_ep),
+            mesh_dim_names=("rows", "cols"),
         )
-        device_mesh['tp']
-        device_mesh['ep','tp']
+
+        # Create aliases for DP
+        # DP will be used for data loading
+        device_mesh[("rows", "cols")]._flatten(mesh_dim_name="dp")
+
+        dp_mesh  = device_mesh["dp"]     # size = R*C = 8  -> used for non-MoE FSDP
+        row_mesh = device_mesh["rows"]   # size = R   = 4  -> used for expert FSDP (inside each column)
+        col_mesh = device_mesh["cols"]   # size = C   = 2  -> used for EP ownership + a2a
+
+
     else:
-        if dp_size * tp_size != world_size:
-            raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
-        device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
+        raise ValueError("Only EP is supported")
+        # if dp_size * tp_size != world_size:
+        #     raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
+        # device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
 
     logger.info(f"{device_mesh=}")
     assert torch.cuda.current_device() == local_rank
@@ -149,31 +171,64 @@ def main(args):
         if rank == 0:
             wandb.init(project="distributed-training")
 
-    logger.info(f"{tokenizer.vocab_size=}")
-    model_args = ModelArgs(use_moe=args.use_moe, vocab_size=tokenizer.vocab_size)
+    # Use len(tokenizer) to get the actual vocabulary size including all special tokens
+    actual_vocab_size = len(tokenizer)
+    logger.info(f"Tokenizer vocab_size attribute: {tokenizer.vocab_size}")
+    logger.info(f"Actual tokenizer length: {actual_vocab_size}")
+
+    model_args = ModelArgs(use_moe=args.use_moe, vocab_size=actual_vocab_size)
     
     # This context allows you to define a model's architecture and a
     # ll its parameters without allocating any memory for the weights, 
+    model_args.device_mesh = device_mesh
     with torch.device("meta"):
         model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
 
-
-    # Dynamically apply parallelization plan
+    
+    # ----- 3) Attach EP to routed experts (columns mesh) -----
+    #   • partitions expert tensors across columns (ownership)
+    #   • installs dispatch/combine (a2a) hooks on forward
     apply_parallelization(
         model=model,
         model_name=args.model_name,
-        world_mesh=device_mesh,
+        mesh=col_mesh,
         model_args=model_args,
         rank=local_rank
     )
+
+
+    # ----- 4) FSDP for MoE on row (4-way) -----
+    for layer_id, transformer_block in enumerate(model.layers):
+        if transformer_block.moe_enabled and row_mesh:
+            fully_shard(
+                transformer_block.feed_forward.experts,
+                mesh=row_mesh,
+            )
+
+    # ----- 5) FSDP for non-MoE on dp (8-way) -----
+    # Instead of wrapping the whole model and then overriding, be explicit:
+    #   - find and wrap ONLY the non-MoE modules on the 8-way dp mesh
+    for layer_id, transformer_block in enumerate(model.layers):
+        fully_shard(
+            transformer_block,
+            mesh=dp_mesh,
+        )
+
     
+    # ----- 5) Wrap everything else on dp (8-way) -----
+    fully_shard(model, mesh=dp_mesh)
+
+
+    logger.info(f"Model after parallelization {model=}\n")
     logger.info("=== Parameter Analysis After Parallelization ===")
     regular_tensors = []
     dtensors = []
 
     for name, param in model.named_parameters():
         if hasattr(param, 'placements'):  # DTensor
+            placement = getattr(param, "placements", None)
+            logger.info(f"{name=}, {placement=}")
             dtensors.append(name)
         else:  # Regular tensor
             regular_tensors.append(name)
@@ -183,10 +238,9 @@ def main(args):
     if regular_tensors:
         logger.info(f"{device=} Regular tensor parameters:")
         for name in regular_tensors:
-            print(f"{device=}, {name=}")
-            pass
+            logger.info(f"{device=}, {name=}")
 
-    # logger.info(f"to_empty")
+
     model.to_empty(device=device)
     # The weights are initialized directly on each target GPU
     # after the model has been parallelized
@@ -195,7 +249,7 @@ def main(args):
         model.init_weights()
 
     # foreach=False is not optimized.
-    optimizer = Adam(model.parameters(), lr=args.lr, foreach=False)
+    optimizer = Adam(model.parameters(), lr=model_args.lr)
 
     monitor = performance_monitor(
         model,
@@ -208,19 +262,18 @@ def main(args):
     def training_step(x, y):
         # Fake forward pass for now
         logits = model(x)
-        logger.info(f"Logits shape: {logits.shape}, requires_grad: {logits.requires_grad}")
-        logger.info(f"{y.shape=}")
+        #logger.info(f"Logits shape: {logits.shape}, requires_grad: {logits.requires_grad}")
+        #logger.info(f"{y.shape=}")
         # Reshape for cross-entropy loss
+        
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), 
             y.view(-1),
             ignore_index=tokenizer.pad_token_id
         )
-        logger.info(f"Loss shape: {loss.shape}, requires_grad: {loss.requires_grad}, {loss=}")
+        #logger.info(f"Loss shape: {loss.shape}, requires_grad: {loss.requires_grad}, {loss=}")
         loss.backward()
         return loss
-
-    batch_size = 2
 
     # --- Data Loading ---
     dataloader = get_hf_dataloader(
@@ -229,13 +282,13 @@ def main(args):
         dataset_split=args.dataset_split,
         tokenizer=tokenizer,
         model_args=model_args,
-        batch_size=batch_size,
-        device_mesh=device_mesh,
+        device_mesh=dp_mesh,
     )
 
     for i, batch in enumerate(dataloader):
-
+        #logger.info(f"{i=}")
         x = batch['input_ids'].to(device, non_blocking=True)
+        #logger.info(f"{x.shape=}")
         y = batch['labels'].to(device, non_blocking=True)
         loss = training_step(x, y)
         
@@ -253,7 +306,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch Distributed Training")
     parser.add_argument("--use-moe", action="store_true", help="Whether to use MoE")
     parser.add_argument("--model-name", type=str, default="model", help="The name of the model folder under /parallelization")
-    parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--ep-size", type=int, default=2, help="Expert parallel size for MoE models")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
@@ -266,9 +318,7 @@ if __name__ == "__main__":
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Enable W&B logging by default (use --no-wandb to disable)")
-    
-    # Training arguments
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate for the optimizer")
+
     
     args = parser.parse_args()
     

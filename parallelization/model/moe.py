@@ -10,6 +10,7 @@ import contextlib
 
 from .args import ModelArgs
 from ..logging import logger
+from ..utils import describe_group, log_tensor
 import wandb
 
 try:
@@ -21,56 +22,11 @@ except ImportError:
 
 from torch.distributed.tensor import DTensor
 
-def log_tensor(label: str, t):
-    if isinstance(t, DTensor):
-        tl = t.to_local()
-        try:
-            mesh = t.device_mesh
-        except Exception:
-            mesh = None
-        logger.info(
-            f"{label}: DTensor "
-            f"global_shape={tuple(t.shape)}, "
-            f"local_shape={tuple(tl.shape)}, "
-            f"placements={t.placements}, "
-            f"mesh={mesh}, "
-            f"local_dtype={tl.dtype}, "
-            f"local_device={tl.device}"
-        )
-    else:
-        logger.info(
-            f"{label}: Tensor "
-            f"shape={tuple(t.shape)}, "
-            f"dtype={t.dtype}, "
-            f"device={t.device}"
-        )
+
 
 from torch.distributed.tensor.debug import visualize_sharding
 
 
-def log_tensor(label: str, t):
-    if isinstance(t, DTensor):
-        tl = t.to_local()
-        try:
-            mesh = t.device_mesh
-        except Exception:
-            mesh = None
-        logger.info(
-            f"{label}: DTensor "
-            f"global_shape={tuple(t.shape)}, "
-            f"local_shape={tuple(tl.shape)}, "
-            f"placements={t.placements}, "
-            f"mesh={mesh}, "
-            f"local_dtype={tl.dtype}, "
-            f"local_device={tl.device}"
-        )
-    else:
-        logger.info(
-            f"{label}: Tensor "
-            f"shape={tuple(t.shape)}, "
-            f"dtype={t.dtype}, "
-            f"device={t.device}"
-        )
 
 
 class Router(nn.Module):
@@ -95,6 +51,13 @@ class Router(nn.Module):
         
         self.model_args = model_args
         self.router = nn.Linear(model_args.dim, model_args.num_experts, bias=False)
+        self.device_mesh = model_args.device_mesh
+        self.update_rate = 0.01
+        self.beta = 0.9
+
+        # === LOSS-FREE BALANCING: Expert bias initialization ===
+        # Register as buffer (persists but not optimized)
+        self.register_buffer('expert_bias', torch.zeros(model_args.num_experts))
         
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -124,25 +87,52 @@ class Router(nn.Module):
         - Output `x_gathered`: Contains data `[x[0], x[2], x[1], x[3], x[0], x[3], x[1], x[2]]`
         """
         # [b*s, h] -> [b*s, num_experts]
-        log_tensor("x before router", x)
-        logger.info(f"is x dtensor: {isinstance(x, DTensor)}")
-
-        expert_scores = self.router(x)
+        expert_scores = self.router(x) + self.expert_bias.unsqueeze(0)
+        
+        # === LOSS-FREE BALANCING: Apply expert bias ===
+        # Add bias to scores BEFORE top-K selection
+        # This steers tokens away from overloaded experts
+        biased_scores = expert_scores + self.expert_bias.to(expert_scores.dtype).unsqueeze(0)
         
         # [b*s, num_experts], [b*s, num_experts]
         # [[0,2], [1,3], ..] token_A-> [0,2] etc
-        top_scores, selected_experts_indices = torch.topk(expert_scores, k=self.model_args.top_k, dim=-1)
+        _, selected_experts_indices = torch.topk(biased_scores, k=self.model_args.top_k, dim=-1)
+
+        # === ADD: Get original scores for the selected experts ===
+        # - The softmax weights should come from the original router scores so gradients flow correctly to the router weights,
+        #  not influenced by the bias terms
+        top_scores = torch.gather(expert_scores, -1, selected_experts_indices)
         top_scores = F.softmax(top_scores, dim=-1, dtype=torch.float32).type_as(x)
+
         
         # histogram!
         # [num_experts]
         # Example: [2.0, 2.0, 2.0, 2.0] # each expert gets 2.
-        num_tokens_per_expert = torch.histc(
+        num_tokens_per_expert = torch.bincount(
             selected_experts_indices.view(-1),
-            bins=self.model_args.num_experts,
-            min=0,            
-            max=self.model_args.num_experts,
+            minlength=self.model_args.num_experts
         )
+
+        with torch.no_grad():
+            counts = num_tokens_per_expert.float()
+            E = counts.numel()
+            # Some Laplace smoothing
+            eps = 1.0
+            frac = (counts + eps) / (counts.sum() + eps * E)
+            target = 1.0 / E
+            bias = target - frac  # zero-sum by construction
+
+            # Some EMA smoothing
+            self.expert_bias.mul_(self.beta).add_((1 - self.beta) * bias)
+            # sync across router-replica group
+            g = self.device_mesh.get_group("dp")
+            dist.all_reduce(self.expert_bias, op=dist.ReduceOp.SUM, group=g)
+            self.expert_bias.div_(dist.get_world_size(g))
+
+            # keep centered and bounded
+            self.expert_bias.sub_(self.expert_bias.mean())
+            logger.info(f"{self.expert_bias=}")
+
 
         # Flattened view before sort: [0, 2, 1, 3, 0, 3, 1, 2]
         # Meaning: [A→E0, A→E2, B→E1, B→E3, C→E0, C→E3, D→E1, D→E2]
@@ -163,9 +153,7 @@ class Router(nn.Module):
         # now x is replicated and in order
         # [b*s*top_k, h]
         #visualize_sharding(x)
-        log_tensor("x", x)
         #visualize_sharding(scatter_indices)
-        log_tensor("scatter_indices", scatter_indices)
         x_gathered = x[scatter_indices]
         
         # Also reorder the scores to match the new token order.
@@ -176,7 +164,9 @@ class Router(nn.Module):
     def init_weights(self, init_std: float):
         with torch.random.fork_rng():
             torch.manual_seed(42)  # Same seed on all ranks
-            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std)
+            logger.info(f"init_weights {init_std=}")
+
+            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std * 0.01)
 
 
 class GroupedExpert(nn.Module):
@@ -207,6 +197,7 @@ class GroupedExpert(nn.Module):
         """
         super().__init__()
         self.model_args = model_args
+        self.device_mesh = model_args.device_mesh
         # fine-grained ratio
         self.w1 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim, model_args.dim // 4))
         self.w2 = nn.Parameter(torch.empty(model_args.num_experts, model_args.dim // 4, model_args.dim))
@@ -220,6 +211,11 @@ class GroupedExpert(nn.Module):
             x (torch.Tensor): Input tensor dispatched to this expert.
             num_tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert.
         """
+
+        col_group_rank = dist.get_rank(self.device_mesh.get_group("cols"))
+        row_group_rank = dist.get_rank(self.device_mesh.get_group("rows"))
+        logger.info(f"{col_group_rank=} {row_group_rank=}")
+        
         # Create a CPU copy for logging and operations that require it
         num_tokens_per_expert_cpu = num_tokens_per_expert.to("cpu").to(torch.int64)
         logger.info(f"{num_tokens_per_expert_cpu=}")
@@ -227,25 +223,23 @@ class GroupedExpert(nn.Module):
         # Log to wandb if enabled
         if wandb.run is not None:
             # Create a dictionary for logging: {'expert_0': 4096, 'expert_1': 4096, ...}
-            token_dist = {f"expert_{i}": count.item() for i, count in enumerate(num_tokens_per_expert_cpu)}
-            wandb.log({"token_distribution": token_dist})
+            for i, count in enumerate(num_tokens_per_expert_cpu):
+                i = i + col_group_rank * len(num_tokens_per_expert_cpu)
+                token_dist = {f"expert_{row_group_rank}_{i}": count.item()}
+                wandb.log({"token_distribution": token_dist})
 
         # --- Fused GMM Kernel ---
         # The rest of the forward pass remains the same...
         x_bf16 = x.to(torch.bfloat16)
 
-        if isinstance(self.w1, DTensor):
-            # The weights are DTensors. We need to convert them to local tensors
-            # to use them with non-DTensor aware ops like ops.gmm
-            w1_bf16 = self.w1.to_local().to(torch.bfloat16)
-            w2_bf16 = self.w2.to_local().to(torch.bfloat16)
-            w3_bf16 = self.w3.to_local().to(torch.bfloat16)
-        else:
-            # The weights are regular tensors, so we can use them directly
-            w1_bf16 = self.w1.to(torch.bfloat16)
-            w2_bf16 = self.w2.to(torch.bfloat16)
-            w3_bf16 = self.w3.to(torch.bfloat16)
-        
+        if not isinstance(self.w1, DTensor):
+            raise RuntimeError("w1 is not a DTensor")
+        # The weights are DTensors. We need to convert them to local tensors
+        # to use them with non-DTensor aware ops like ops.gmm
+        w1_bf16 = self.w1.to_local().to(torch.bfloat16)
+        w2_bf16 = self.w2.to_local().to(torch.bfloat16)
+        w3_bf16 = self.w3.to_local().to(torch.bfloat16)
+    
         # MLP layers with activation
         # Expected batch_sizes.size(0) == num_experts
         #logger.info(f"{x_bf16.shape=}, {w1_bf16.shape=} {num_tokens_per_expert_cpu=}")
@@ -253,7 +247,7 @@ class GroupedExpert(nn.Module):
         x3 = ops.gmm(x_bf16, w3_bf16, num_tokens_per_expert_cpu, trans_b=False)
         h = F.silu(x1) * x3
         out = ops.gmm(h, w2_bf16, num_tokens_per_expert_cpu, trans_b=False)
-        logger.info(f"out shape: {out.shape} and dtype: {out.dtype} and type: {type(out)} and requires_grad: {out.requires_grad}")
+        #logger.info(f"out shape: {out.shape} and dtype: {out.dtype} and type: {type(out)} and requires_grad: {out.requires_grad}")
         return out.to(x.dtype)
 
     def init_weights(self, init_std: float):
