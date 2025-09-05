@@ -25,6 +25,7 @@ class ModelArgs:
     num_experts: int = 4
     top_k: int = 2
     use_moe: bool = True
+    score_func: str = "sigmoid"
 
     # lr
     lr: float = 0.00005

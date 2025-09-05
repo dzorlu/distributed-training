@@ -54,6 +54,7 @@ class Router(nn.Module):
         self.device_mesh = model_args.device_mesh
         self.update_rate = 0.01
         self.beta = 0.9
+        self.score_func = model_args.score_func
 
         # === LOSS-FREE BALANCING: Expert bias initialization ===
         # Register as buffer (persists but not optimized)
@@ -87,11 +88,23 @@ class Router(nn.Module):
         - Output `x_gathered`: Contains data `[x[0], x[2], x[1], x[3], x[0], x[3], x[1], x[2]]`
         """
         # [b*s, h] -> [b*s, num_experts]
-        expert_scores = self.router(x) + self.expert_bias.unsqueeze(0)
+        expert_scores = self.router(x)
+
+
+        # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
+        # expert score are normalized such that bias can have a real impact on the routing decision
+        if self.score_func == "sigmoid":
+            expert_scores = torch.sigmoid(expert_scores.to(torch.float32))
+        elif self.score_func == "softmax":
+            expert_scores = F.softmax(expert_scores.to(torch.float32), dim=1)
+        else:
+            raise NotImplementedError(f"Unknown score function {self.score_func}")
+
         
         # === LOSS-FREE BALANCING: Apply expert bias ===
         # Add bias to scores BEFORE top-K selection
         # This steers tokens away from overloaded experts
+        logger.info(f"{expert_scores.mean(axis=0)=}")
         biased_scores = expert_scores + self.expert_bias.to(expert_scores.dtype).unsqueeze(0)
         
         # [b*s, num_experts], [b*s, num_experts]
@@ -102,7 +115,9 @@ class Router(nn.Module):
         # - The softmax weights should come from the original router scores so gradients flow correctly to the router weights,
         #  not influenced by the bias terms
         top_scores = torch.gather(expert_scores, -1, selected_experts_indices)
-        top_scores = F.softmax(top_scores, dim=-1, dtype=torch.float32).type_as(x)
+        # need to normalize for sigmoid so that the sum of the top_scores is 1
+        if self.score_func == "sigmoid":
+            top_scores = top_scores / top_scores.sum(dim=-1, keepdim=True)  
 
         
         # histogram!
@@ -164,8 +179,6 @@ class Router(nn.Module):
     def init_weights(self, init_std: float):
         with torch.random.fork_rng():
             torch.manual_seed(42)  # Same seed on all ranks
-            logger.info(f"init_weights {init_std=}")
-
             nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std * 0.01)
 
 
