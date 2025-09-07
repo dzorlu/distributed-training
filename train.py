@@ -5,6 +5,7 @@ import re
 import importlib
 import wandb
 from datetime import timedelta
+from contextlib import nullcontext
 
 # Import the ray and profiler decorators
 from parallelization import ray_distributed
@@ -32,8 +33,12 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor import Shard, Replicate
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import set_rotate_method
 from torch.optim import Adam
-from transformers import AutoTokenizer
+
+
+
 from parallelization.dataset import get_hf_dataloader
 
 def get_device_info() -> tuple[str, torch.device]:
@@ -124,6 +129,13 @@ def main(args):
     
     dp_size = args.dp_size
 
+    if args.use_cp and args.use_moe:
+        raise ValueError("CP and MoE are not supported together")
+
+    ########################
+    # Mesh initialization  #
+    ########################
+
     if args.use_moe:
         ep_size = args.ep_size
         dp_shard = dp_size  # treat provided dp_size as the total DP sharding degree
@@ -133,7 +145,7 @@ def main(args):
             )
 
         dp_shard_in_ep = ep_size                # borrowed by EP (forms EP groups)
-        dp_shard_mod_ep = dp_shard // ep_size   # leftover for FSDP sharding
+        dp_shard_mod_ep = dp_shard // ep_size   # leftover for FSDP sharding. borrowing!
 
         # With only DP+EP (tp=cp=pp=1), the total WORLD_SIZE equals dp_shard
         if dp_shard != world_size:
@@ -145,20 +157,37 @@ def main(args):
         device_mesh = init_device_mesh(
             "cuda",
             (dp_shard_mod_ep, dp_shard_in_ep),
-            mesh_dim_names=("rows", "cols"),
+            mesh_dim_names=("dp_shard", "ep"),
         )
 
         # Create aliases for DP
         # DP will be used for data loading
-        device_mesh[("rows", "cols")]._flatten(mesh_dim_name="dp")
+        device_mesh[("dp_shard", "ep")]._flatten(mesh_dim_name="dp")
 
         dp_mesh  = device_mesh["dp"]     # size = R*C = 8  -> used for non-MoE FSDP
-        row_mesh = device_mesh["rows"]   # size = R   = 4  -> used for expert FSDP (inside each column)
-        col_mesh = device_mesh["cols"]   # size = C   = 2  -> used for EP ownership + a2a
+        row_mesh = device_mesh["dp_shard"]   # size = R   = 4  -> used for expert FSDP (inside each column)
+        col_mesh = device_mesh["ep"]   # size = C   = 2  -> used for EP ownership + a2a
+    
+    elif args.use_cp:
 
+        # Create the 2D mesh
+        # FSDP is still on dp_size because cp regions need to be all-reduced as well -
+        # CP itself doesn’t add a model-wide grad all-reduce.
+        # If dp=1 and cp>1 without FSDP, you’d train unsynchronized replicas (not desirable).
+        device_mesh = init_device_mesh(
+            "cuda",
+            (args.dp_size, args.cp_size),
+            mesh_dim_names=("dp_shard", "cp"),
+        )
+
+        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp")
+
+        dp_mesh = device_mesh["dp_shard"]   # size = R   = 4  -> used for data parallelism. 
+        row_mesh  = device_mesh["dp"]     # size = R*C = 8  -> used for FSDP
+        col_mesh = device_mesh["cp"]   # size = C   = 2  -> used for CP
 
     else:
-        raise ValueError("Only EP is supported")
+        raise ValueError("Only EP or CP is supported")
         # if dp_size * tp_size != world_size:
         #     raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
         # device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
@@ -185,39 +214,53 @@ def main(args):
         model = Transformer.from_model_args(model_args)
     log_parameter_count(model, model_args)
 
-    
-    # ----- 3) Attach EP to routed experts (columns mesh) -----
-    #   • partitions expert tensors across columns (ownership)
-    #   • installs dispatch/combine (a2a) hooks on forward
-    apply_parallelization(
-        model=model,
-        model_name=args.model_name,
-        mesh=col_mesh,
-        model_args=model_args,
-        rank=local_rank
-    )
+    if args.use_moe:
+        # ----- 3) Attach EP to routed experts (columns mesh) -----
+        #   • partitions expert tensors across columns (ownership)
+        #   • installs dispatch/combine (a2a) hooks on forward
+        apply_parallelization(
+            model=model,
+            model_name=args.model_name,
+            mesh=col_mesh,
+            model_args=model_args,
+            rank=local_rank
+        )
 
 
-    # ----- 4) FSDP for MoE on row (4-way) -----
-    for layer_id, transformer_block in enumerate(model.layers):
-        if transformer_block.moe_enabled and row_mesh:
+        # ----- 4) FSDP for MoE on row (4-way) -----
+        for layer_id, transformer_block in enumerate(model.layers):
+            if transformer_block.moe_enabled and row_mesh:
+                fully_shard(
+                    transformer_block.feed_forward.experts,
+                    mesh=row_mesh,
+                )
+
+        # ----- 5) FSDP for non-MoE on dp (8-way) -----
+        # Instead of wrapping the whole model and then overriding, be explicit:
+        #   - find and wrap ONLY the non-MoE modules on the 8-way dp mesh
+        for layer_id, transformer_block in enumerate(model.layers):
             fully_shard(
-                transformer_block.feed_forward.experts,
+                transformer_block,
+                mesh=dp_mesh,
+            )
+
+        # ----- 5) Wrap everything else on dp (8-way) -----
+        fully_shard(model, mesh=dp_mesh)
+
+    elif args.use_cp:
+        # https://docs.pytorch.org/tutorials/unstable/context_parallel.html
+        # https://discuss.pytorch.org/t/distributed-w-torchtitan-breaking-barriers-training-long-context-llms-with-1m-sequence-length-in-pytorch-using-context-parallel/215082
+        set_rotate_method('allgather')
+
+        # ----- 5) FSDP for CP on dp (8-way) -----
+        for layer_id, transformer_block in enumerate(model.layers):
+            fully_shard(
+                transformer_block,
                 mesh=row_mesh,
             )
 
-    # ----- 5) FSDP for non-MoE on dp (8-way) -----
-    # Instead of wrapping the whole model and then overriding, be explicit:
-    #   - find and wrap ONLY the non-MoE modules on the 8-way dp mesh
-    for layer_id, transformer_block in enumerate(model.layers):
-        fully_shard(
-            transformer_block,
-            mesh=dp_mesh,
-        )
-
-    
-    # ----- 5) Wrap everything else on dp (8-way) -----
-    fully_shard(model, mesh=dp_mesh)
+        # ----- 5) Wrap everything else on dp (8-way) -----
+        fully_shard(model, mesh=row_mesh)
 
 
     logger.info(f"Model after parallelization {model=}\n")
@@ -258,22 +301,27 @@ def main(args):
         comm_logger_step=2,
     )
 
+
     @monitor
     def training_step(x, y):
-        # Fake forward pass for now
-        logits = model(x)
-        #logger.info(f"Logits shape: {logits.shape}, requires_grad: {logits.requires_grad}")
-        #logger.info(f"{y.shape=}")
-        # Reshape for cross-entropy loss
-        
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            y.view(-1),
-            ignore_index=tokenizer.pad_token_id
-        )
-        #logger.info(f"Loss shape: {loss.shape}, requires_grad: {loss.requires_grad}, {loss=}")
-        loss.backward()
-        return loss
+        ctx = nullcontext()
+        if args.use_cp:
+            ctx = context_parallel(
+                col_mesh,
+                buffers=[x, y, model.freqs_cis],
+                buffer_seq_dims=[1, 1, 0],
+                no_restore_buffers={x, y},
+            )
+        with ctx:
+            logits = model(x)
+            
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                y.view(-1),
+                ignore_index=tokenizer.pad_token_id
+            )
+            loss.backward()
+            return loss
 
     # --- Data Loading ---
     dataloader = get_hf_dataloader(
