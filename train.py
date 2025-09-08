@@ -376,25 +376,39 @@ def main(args):
     # Zero once before the first accumulation window
     optimizer.zero_grad(set_to_none=True)
     accumulated_losses: List[torch.Tensor] = []
+    accumulated_n_tokens_seen = 0
     for i, batch in enumerate(dataloader, 1):
-        #logger.info(f"{i=}")    
         x = batch['input_ids'].to(device, non_blocking=True)
         #logger.info(f"{x.shape=}")
         y = batch['labels'].to(device, non_blocking=True)
         loss = training_step(x, y)
+
         accumulated_losses.append(loss.detach())
+        accumulated_n_tokens_seen += y.numel()
         
         if i % model_args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # Sum of n_tokens_seen equals mean n_tokens_seen over the accumulation window
+            log_n_tokens_seen = torch.tensor(accumulated_n_tokens_seen, device=device, dtype=torch.long)
+            reduceOp = c10d.ReduceOp.SUM.name
+            log_n_tokens_seen = funcol.all_reduce(log_n_tokens_seen, reduceOp=reduceOp, group=dp_mesh)
+
+        
             # Sum of scaled losses equals mean loss over the accumulation window
             log_loss = torch.sum(torch.stack(accumulated_losses))
             reduceOp = c10d.ReduceOp.AVG.name
             log_loss = funcol.all_reduce(log_loss, reduceOp=reduceOp, group=dp_mesh)
             if args.wandb and rank == 0:
-                wandb.log({"loss": log_loss.item()})
+                wandb.log(
+                    {
+                        "loss": log_loss.item(),
+                        "n_tokens_seen": log_n_tokens_seen.item(),
+                    }
+                )
             accumulated_losses = []
+            accumulated_n_tokens_seen = 0
 
     # Flush leftover microbatches if the last window is incomplete
     if accumulated_losses:

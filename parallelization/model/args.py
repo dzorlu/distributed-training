@@ -4,7 +4,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 @dataclass
 class ModelArgs:
-    dim: int = 2048 #2048
+    dim: int = 1024 #2048
     n_layers: int = 16 #64
     n_heads: int = 16
     n_kv_heads: Optional[int] = None
@@ -17,7 +17,7 @@ class ModelArgs:
 
     batch_size: int = 4
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     # If `True`, then each transfor
     # mer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks

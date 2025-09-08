@@ -31,39 +31,23 @@ def get_hf_dataloader(
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     def tokenize_and_format(examples):
-        # Handle different dataset formats
         texts = []
+        for messages_pair in examples["messages"]:
+            # messages_pair is [user_dict, assistant_dict]
+            if len(messages_pair) == 2:
+                user_msg = messages_pair[0]
+                assistant_msg = messages_pair[1]
+                
+                # Extract content from each message dict
+                user_content = user_msg.get("content", "") if isinstance(user_msg, dict) else str(user_msg)
+                assistant_content = assistant_msg.get("content", "") if isinstance(assistant_msg, dict) else str(assistant_msg)
+                
+                # Format as conversation
+                full_text = f"User: {user_content}\n\nAssistant: {assistant_content}"
+                texts.append(full_text)
+            else:
+                texts.append("")
         
-        # Check what columns we have
-        if "text" in examples:
-            texts = examples["text"]
-        elif "messages" in examples:
-            # Handle conversation format (like LongAlign)
-            for messages in examples["messages"]:
-                if isinstance(messages, list):
-                    # Concatenate all messages in the conversation
-                    conversation = ""
-                    for msg in messages:
-                        if isinstance(msg, dict):
-                            # Format: role: content
-                            role = msg.get("role", "")
-                            content = msg.get("content", "")
-                            conversation += f"{role}: {content}\n"
-                        else:
-                            conversation += str(msg) + "\n"
-                    texts.append(conversation.strip())
-                else:
-                    # Fallback: convert to string
-                    texts.append(str(messages))
-        else:
-            raise ValueError(f"No text column found in dataset: {examples.keys()}")
-        
-        # Ensure texts is a list of strings
-        if not isinstance(texts, list):
-            texts = [texts]
-        texts = [str(t) for t in texts]  # Convert everything to strings
-        
-        # Tokenize
         tokenized = tokenizer(
             texts,
             truncation=True,
@@ -71,7 +55,6 @@ def get_hf_dataloader(
             max_length=seq_len,
         )
         
-        # For next-token prediction, labels are inputs shifted by one
         labels = [l[1:] + [tokenizer.pad_token_id] for l in tokenized["input_ids"]]
         
         return {
@@ -83,10 +66,12 @@ def get_hf_dataloader(
     formatted_dataset = dataset.map(
         tokenize_and_format, 
         batched=True,
-        remove_columns=dataset.column_names  # Remove original columns
+        batch_size=model_args.batch_size * 20,
+        remove_columns=dataset.column_names,  # Remove original columns
+        num_proc=20,
     ).with_format(
         type="torch", 
-        columns=["input_ids", "labels"]
+        columns=["input_ids", "labels"],
     )
 
     # Get DP rank and size from the device mesh
@@ -99,7 +84,7 @@ def get_hf_dataloader(
         formatted_dataset,
         num_replicas=dp_size,
         rank=dp_rank,
-        shuffle=True,
+        shuffle=False,
         drop_last=True,
     )
 
@@ -107,7 +92,7 @@ def get_hf_dataloader(
         formatted_dataset,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
     )
