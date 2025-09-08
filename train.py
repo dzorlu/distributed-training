@@ -363,6 +363,7 @@ def main(args):
             return _loss
 
     # --- Data Loading ---
+    logger.info(f"{args.dataset_name=}, {args.dataset_config_name=}, {args.dataset_split=}")
     dataloader = get_hf_dataloader(
         dataset_name=args.dataset_name,
         dataset_config_name=args.dataset_config_name,
@@ -422,10 +423,10 @@ if __name__ == "__main__":
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
     parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
     #parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
-    parser.add_argument("--dataset-name", type=str, default="HuggingFaceFW/fineweb", help="Hugging Face dataset name")
-    parser.add_argument("--dataset-config-name", type=str, default="sample-10BT", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
-    #parser.add_argument("--dataset-config-name", type=str, help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
-    parser.add_argument("--dataset-split", type=str, default="train[:1000]", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
+    parser.add_argument("--dataset-name", type=str, default="zai-org/LongAlign-10k", help="Hugging Face dataset name")
+    #parser.add_argument("--dataset-config-name", type=str, default="sample-10BT", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    parser.add_argument("--dataset-config-name", type=str, help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")

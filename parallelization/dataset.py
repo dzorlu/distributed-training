@@ -20,6 +20,7 @@ def get_hf_dataloader(
     """
     seq_len = model_args.max_seq_len
     batch_size = model_args.batch_size
+    
     dataset = load_dataset(
         dataset_name,
         name=dataset_config_name,
@@ -30,15 +31,47 @@ def get_hf_dataloader(
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     def tokenize_and_format(examples):
-        # Tokenize and truncate
+        # Handle different dataset formats
+        texts = []
+        
+        # Check what columns we have
+        if "text" in examples:
+            texts = examples["text"]
+        elif "messages" in examples:
+            # Handle conversation format (like LongAlign)
+            for messages in examples["messages"]:
+                if isinstance(messages, list):
+                    # Concatenate all messages in the conversation
+                    conversation = ""
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            # Format: role: content
+                            role = msg.get("role", "")
+                            content = msg.get("content", "")
+                            conversation += f"{role}: {content}\n"
+                        else:
+                            conversation += str(msg) + "\n"
+                    texts.append(conversation.strip())
+                else:
+                    # Fallback: convert to string
+                    texts.append(str(messages))
+        else:
+            raise ValueError(f"No text column found in dataset: {examples.keys()}")
+        
+        # Ensure texts is a list of strings
+        if not isinstance(texts, list):
+            texts = [texts]
+        texts = [str(t) for t in texts]  # Convert everything to strings
+        
+        # Tokenize
         tokenized = tokenizer(
-            examples["text"],
+            texts,
             truncation=True,
             padding="max_length",
             max_length=seq_len,
         )
         
-        # For next-token prediction, labels are inputs shifted by one.
+        # For next-token prediction, labels are inputs shifted by one
         labels = [l[1:] + [tokenizer.pad_token_id] for l in tokenized["input_ids"]]
         
         return {
@@ -46,17 +79,21 @@ def get_hf_dataloader(
             "labels": labels
         }
 
-    # We need to set the format to torch and specify columns to keep
-    formatted_dataset = dataset.map(tokenize_and_format, batched=True).with_format(
-        type="torch", columns=["input_ids", "labels"]
+    # Apply mapping and format
+    formatted_dataset = dataset.map(
+        tokenize_and_format, 
+        batched=True,
+        remove_columns=dataset.column_names  # Remove original columns
+    ).with_format(
+        type="torch", 
+        columns=["input_ids", "labels"]
     )
 
     # Get DP rank and size from the device mesh
-    dp_rank = device_mesh.get_coordinate()[0] # e.g., (0, 2)
+    dp_rank = device_mesh.get_coordinate()[0]
     dp_size = device_mesh.mesh.size(0)
 
     logger.info(f"{dp_rank=}, {dp_size=}")
-
 
     sampler = DistributedSampler(
         formatted_dataset,
@@ -70,7 +107,7 @@ def get_hf_dataloader(
         batch_size=batch_size,
         sampler=sampler,
         num_workers=2,
-        pin_memory=True, # For faster CPU to GPU data transfer
+        pin_memory=True,
     )
     logger.info(f"{dataloader=}")
 
