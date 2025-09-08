@@ -99,7 +99,8 @@ def get_hf_dataloader(
         formatted_dataset,
         num_replicas=dp_size,
         rank=dp_rank,
-        shuffle=True
+        shuffle=True,
+        drop_last=True,
     )
 
     dataloader = DataLoader(
@@ -108,6 +109,7 @@ def get_hf_dataloader(
         sampler=sampler,
         num_workers=2,
         pin_memory=True,
+        drop_last=True,
     )
     logger.info(f"{dataloader=}")
 
