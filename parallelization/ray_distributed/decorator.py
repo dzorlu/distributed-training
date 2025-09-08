@@ -2,6 +2,8 @@ import os
 import ray
 import socket
 import subprocess
+import signal
+import time
 import sys
 from functools import wraps
 from ..logging import logger
@@ -81,10 +83,11 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
             logger.info(f"   Master: {master_addr}:{master_port}")
             logger.info(f"   Module: {module_name}")
             
-            @ray.remote(num_gpus=gpus_per_node, max_restarts=1)
+            @ray.remote(num_gpus=gpus_per_node, max_restarts=1, max_concurrency=2)
             class NodeRunner:
                 def __init__(self, node_rank):
                     self.node_rank = node_rank
+                    self.proc = None
                 
                 def run_torchrun(self, master_addr, master_port, module_name, args):
                     """Run torchrun on this node."""
@@ -95,19 +98,46 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
                         f"--node_rank={self.node_rank}",
                         f"--master_addr={master_addr}",
                         f"--master_port={master_port}",
-                        "-m", module_name
-                    ] + args
+                        "-m", module_name,
+                        *args,
+                    ]
                     
                     logger.info(f"Node {self.node_rank}: {' '.join(cmd)}")
                     
                     try:
-                        # Run without capturing output so we can see training progress in real-time
-                        result = subprocess.run(cmd, check=True)
-                        logger.info(f"✅ Node {self.node_rank} completed successfully")
-                        return result
-                    except subprocess.CalledProcessError as e:
-                        logger.error(f"❌ Node {self.node_rank} failed with exit code {e.returncode}")
-                        raise
+                        # Start torchrun in its own process group so we can terminate the whole tree
+                        self.proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+                        rc = self.proc.wait()
+                        # Normalize negative rc (killed by signal) to 128+signal
+                        norm_rc = rc if rc >= 0 else 128 + abs(rc)
+                        if norm_rc in (130, 143):  # SIGINT, SIGTERM
+                            logger.info(f"🛑 Node {self.node_rank} interrupted (rc={rc})")
+                        else:
+                            logger.info(f"✅ Node {self.node_rank} exited with code {rc}")
+                        return rc
+                    finally:
+                        self.proc = None
+
+                def stop(self):
+                    if self.proc and self.proc.poll() is None:
+                        try:
+                            # Try graceful KeyboardInterrupt first so worker finally blocks run
+                            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+                            # Give it a moment to exit gracefully
+                            for _ in range(10):
+                                if self.proc.poll() is not None:
+                                    break
+                                time.sleep(0.2)
+                            if self.proc.poll() is None:
+                                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                                for _ in range(10):
+                                    if self.proc.poll() is not None:
+                                        break
+                                    time.sleep(0.2)
+                            if self.proc.poll() is None:
+                                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                        except Exception:
+                            pass
             
             # Create runners for each node
             # Ray will distribute these across available nodes
@@ -126,6 +156,19 @@ def ray_distributed(num_nodes=1, gpus_per_node=1):
                 results = ray.get(futures)
                 logger.info("✅ Distributed training completed successfully!")
                 return results
+            except KeyboardInterrupt:
+                logger.info("❌ Distributed training interrupted by user")
+                for r in runners:
+                    try:
+                        ray.get(r.stop.remote(), timeout=2)
+                    except Exception:
+                        pass
+                for f in futures:
+                    try:
+                        ray.cancel(f, force=True)
+                    except Exception:
+                        pass
+                raise
             except Exception as e:
                 logger.error(f"❌ Distributed training failed: {e}")
                 raise

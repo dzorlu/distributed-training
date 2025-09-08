@@ -421,9 +421,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
     parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
-    parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
-    parser.add_argument("--dataset-config-name", type=str, default="wikitext-2-raw-v1", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
-    parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
+    #parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-name", type=str, default="HuggingFaceFW/fineweb", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-config-name", type=str, default="sample-10BT", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    #parser.add_argument("--dataset-config-name", type=str, help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    parser.add_argument("--dataset-split", type=str, default="train[:1000]", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
     
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
@@ -441,7 +443,6 @@ if __name__ == "__main__":
         distributed_main(args)
     except KeyboardInterrupt as e:
         logger.error(f"Error: {e}")
-        pass
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
