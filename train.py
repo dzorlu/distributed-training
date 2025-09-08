@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import importlib
+from typing import List
 import wandb
 from datetime import timedelta
 from contextlib import nullcontext
@@ -30,6 +31,8 @@ from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor import Shard, Replicate
 from torch.distributed.fsdp import fully_shard
@@ -87,6 +90,17 @@ def extract_unique_param_names(model):
             seen.add(pattern)
     
     return unique_patterns
+
+def rescale_accumulated_loss(unwrapped_loss_fn, accumulation_steps: int):
+    """Return a loss function that divides by accumulation_steps.
+
+    This ensures that summing the per-microbatch losses over N steps yields
+    the mean loss, and gradients accumulated across those N backward calls
+    equal the average gradient.
+    """
+    def _wrapped(*args, **kwargs):
+        return unwrapped_loss_fn(*args, **kwargs) / accumulation_steps
+    return _wrapped
 
 @record
 def main(args):
@@ -187,10 +201,15 @@ def main(args):
         col_mesh = device_mesh["cp"]   # size = C   = 2  -> used for CP
 
     else:
-        raise ValueError("Only EP or CP is supported")
-        # if dp_size * tp_size != world_size:
-        #     raise ValueError(f"World size {world_size} must be equal to dp_size * tp_size")
-        # device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp","tp",))
+        # FSDP
+        device_mesh = init_device_mesh(
+            "cuda",
+            (args.dp_size, args.cp_size),
+            mesh_dim_names=("dp_shard")
+        )
+        row_mesh  = device_mesh["dp_shard"]
+        dp_mesh  = device_mesh["dp_shard"] 
+
 
     logger.info(f"{device_mesh=}")
     assert torch.cuda.current_device() == local_rank
@@ -261,6 +280,18 @@ def main(args):
 
         # ----- 5) Wrap everything else on dp (8-way) -----
         fully_shard(model, mesh=row_mesh)
+    else:
+        # ----- 1) FSDP
+        for layer_id, transformer_block in enumerate(model.layers):
+            fully_shard(
+                transformer_block,
+                mesh=row_mesh,
+            )
+
+        # ----- 2) Wrap everything else on dp (8-way) -----
+        fully_shard(model, mesh=row_mesh)
+
+ 
 
 
     logger.info(f"Model after parallelization {model=}\n")
@@ -302,6 +333,18 @@ def main(args):
     )
 
 
+    # Build a scaled loss function for gradient accumulation
+    def _base_loss_fn(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            y.view(-1),
+            ignore_index=tokenizer.pad_token_id,
+        )
+
+    loss_fn = rescale_accumulated_loss(
+        _base_loss_fn, model_args.gradient_accumulation_steps
+    )
+
     @monitor
     def training_step(x, y):
         ctx = nullcontext()
@@ -314,14 +357,10 @@ def main(args):
             )
         with ctx:
             logits = model(x)
-            
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                y.view(-1),
-                ignore_index=tokenizer.pad_token_id
-            )
-            loss.backward()
-            return loss
+            _loss = loss_fn(logits, y)
+            del logits  # avoid peaking memory at the start of the backward pass.
+            _loss.backward()
+            return _loss
 
     # --- Data Loading ---
     dataloader = get_hf_dataloader(
@@ -333,17 +372,38 @@ def main(args):
         device_mesh=dp_mesh,
     )
 
-    for i, batch in enumerate(dataloader):
-        #logger.info(f"{i=}")
+    # Zero once before the first accumulation window
+    optimizer.zero_grad(set_to_none=True)
+    accumulated_losses: List[torch.Tensor] = []
+    for i, batch in enumerate(dataloader, 1):
+        #logger.info(f"{i=}")    
         x = batch['input_ids'].to(device, non_blocking=True)
         #logger.info(f"{x.shape=}")
         y = batch['labels'].to(device, non_blocking=True)
         loss = training_step(x, y)
+        accumulated_losses.append(loss.detach())
         
-        optimizer.step()
+        if i % model_args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
+            # Sum of scaled losses equals mean loss over the accumulation window
+            log_loss = torch.sum(torch.stack(accumulated_losses))
+            reduceOp = c10d.ReduceOp.AVG.name
+            log_loss = funcol.all_reduce(log_loss, reduceOp=reduceOp, group=dp_mesh)
+            if args.wandb and rank == 0:
+                wandb.log({"loss": log_loss.item()})
+            accumulated_losses = []
+
+    # Flush leftover microbatches if the last window is incomplete
+    if accumulated_losses:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        log_loss = torch.sum(torch.stack(accumulated_losses))
+        reduceOp = c10d.ReduceOp.AVG.name
+        log_loss = funcol.all_reduce(log_loss, reduceOp=reduceOp, group=dp_mesh)
         if args.wandb and rank == 0:
-            wandb.log({"loss": loss.item()})
+            wandb.log({"loss": log_loss.item()})
 
     if args.wandb and rank == 0:
         wandb.finish()
@@ -353,9 +413,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch Distributed Training")
     parser.add_argument("--use-moe", action="store_true", help="Whether to use MoE")
+    parser.add_argument("--use-cp", action="store_true", help="Whether to use Context Parallel")
     parser.add_argument("--model-name", type=str, default="model", help="The name of the model folder under /parallelization")
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--ep-size", type=int, default=2, help="Expert parallel size for MoE models")
+    parser.add_argument("--cp-size", type=int, default=2, help="Conetext parallel size")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=2, help="Number of GPUs per node")
     parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
@@ -375,4 +437,13 @@ if __name__ == "__main__":
     
     # Apply ray decorator for distributed training
     distributed_main = ray_distributed(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
-    distributed_main(args)
+    try:
+        distributed_main(args)
+    except KeyboardInterrupt as e:
+        logger.error(f"Error: {e}")
+        pass
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+            logger.info("Process group destroyed")
+            wandb.finish()
