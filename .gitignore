@@ -3,7 +3,6 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-
 skypilot_small.yaml
 
 # C extensions
