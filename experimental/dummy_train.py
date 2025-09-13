@@ -70,6 +70,7 @@ def test_dtensor_sync():
     dist.barrier()
     print()
     
+    ################################################################
     # Test 2: Break DTensor with to_local (gradients won't sync)
     print(f"[TEST 2] DTensor broken with .to_local()")
     model2 = SimpleModel().cuda()

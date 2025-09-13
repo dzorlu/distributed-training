@@ -1,6 +1,7 @@
 
 import argparse
 import os
+import sys
 import re
 import importlib
 from typing import List
@@ -8,8 +9,7 @@ import wandb
 from datetime import timedelta
 from contextlib import nullcontext
 
-# Import the ray and profiler decorators
-from parallelization import ray_distributed
+# Import backends lazily when chosen to avoid hard dependency costs
 from parallelization.profiler.decorator import performance_monitor
 from parallelization.profiler.utils import log_parameter_count
 from parallelization.model.llama2_model import Transformer
@@ -445,6 +445,7 @@ if __name__ == "__main__":
     # Profiler arguments
     parser.add_argument("--profile", action="store_true", default=False, help="Enable PyTorch profiler")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Enable W&B logging by default (use --no-wandb to disable)")
+    parser.add_argument("--backend", type=str, choices=["ray", "modal"], default="ray", help="Execution backend")
 
     
     args = parser.parse_args()
@@ -452,8 +453,17 @@ if __name__ == "__main__":
     # Apply decorators dynamically based on CLI args
     training_func = main
     
-    # Apply ray decorator for distributed training
-    distributed_main = ray_distributed(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
+    # Select backend (CLI overrides env)
+    backend = args.backend or os.environ.get("BACKEND", "ray")
+
+    if backend == "modal":
+        if args.num_nodes and args.num_nodes != 1:
+            raise ValueError("Modal backend currently supports single-node only; set --num-nodes 1")
+        from backend.modal.decorator import modal_distributed
+        distributed_main = modal_distributed()(training_func)
+    else:
+        from backend.ray_distributed.decorator import ray_distributed
+        distributed_main = ray_distributed(num_nodes=args.num_nodes, gpus_per_node=args.gpus_per_node)(training_func)
     try:
         distributed_main(args)
     except KeyboardInterrupt as e:

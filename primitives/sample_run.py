@@ -1,6 +1,8 @@
 import torch
 import torch.distributed as dist
 import os
+from statistics import mean
+from parallelization.logging import logger, init_logger
 
 # ============================================================================
 # SETUP: Device Binding for Multi-GPU Training
@@ -32,13 +34,13 @@ def example_reduce():
     # rank 2: [3, 3, 3, 3, 3]
     tensor = torch.tensor([dist.get_rank() + 1] * 5, dtype=torch.float32).cuda()
     rank = dist.get_rank()
-    print(f"Before reduce on rank {rank}: {tensor}")
+    logger.info(f"Before reduce on rank {rank}: {tensor}")
     
     # SUM all tensors to rank 0 (dst=0)
     # Only rank 0 gets: [1+2+3, 1+2+3, 1+2+3, 1+2+3, 1+2+3] = [6, 6, 6, 6, 6]
     # Other ranks: tensor unchanged
     dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
-    print(f"After reduce on rank {rank}: {tensor}")
+    logger.info(f"After reduce on rank {rank}: {tensor}")
 
 def example_all_reduce():
     """
@@ -64,12 +66,12 @@ def example_all_reduce():
     optimizer.step()  # Each GPU: update with averaged gradients
     """
     tensor = torch.tensor([dist.get_rank() + 1] * 5, dtype=torch.float32).cuda()
-    print(f"Before all_reduce on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"Before all_reduce on rank {dist.get_rank()}: {tensor}")
     
     # ALL ranks get: [1+2+3, 1+2+3, 1+2+3, 1+2+3, 1+2+3] = [6, 6, 6, 6, 6]
     # This is THE operation for distributed training gradient synchronization
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    print(f"After all_reduce on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"After all_reduce on rank {dist.get_rank()}: {tensor}")
     
 def example_gather():
     """
@@ -89,7 +91,7 @@ def example_gather():
     Example evaluation workflow:
     local_accuracy = evaluate_batch(my_test_batch)
     gather(all_accuracies, local_accuracy, dst=0)  # Collect at rank 0
-    if rank == 0: print(f"Overall accuracy: {mean(all_accuracies)}")
+    if rank == 0: logger.info(f"Overall accuracy: {mean(all_accuracies)}")
     """
     tensor = torch.tensor([dist.get_rank() + 1] * 5, dtype=torch.float32).cuda()
     
@@ -104,7 +106,7 @@ def example_gather():
     else:
         gather_list = None  # Non-destination ranks don't need storage
     
-    print(f"Before gather on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"Before gather on rank {dist.get_rank()}: {tensor}")
     
     # Result at rank 0:
     # gather_list[0] = [1, 1, 1, 1, 1]  # from rank 0
@@ -113,7 +115,7 @@ def example_gather():
     dist.gather(tensor, gather_list, dst=0)
     
     if dist.get_rank() == 0:
-        print(f"After gather on rank 0: {gather_list}")
+        logger.info(f"After gather on rank 0: {gather_list}")
 
 def example_all_gather():
     """
@@ -143,14 +145,14 @@ def example_all_gather():
         torch.zeros(5, dtype=torch.float32).cuda()
         for _ in range(dist.get_world_size())
         ]
-    print(f"Before all_gather on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"Before all_gather on rank {dist.get_rank()}: {tensor}")
     
     # ALL ranks get the same result:
     # gather_list[0] = [1, 1, 1, 1, 1]  # from rank 0
     # gather_list[1] = [2, 2, 2, 2, 2]  # from rank 1
     # gather_list[2] = [3, 3, 3, 3, 3]  # from rank 2
     dist.all_gather(gather_list, tensor)
-    print(f"After all_gather on rank {dist.get_rank()}: {gather_list}")
+    logger.info(f"After all_gather on rank {dist.get_rank()}: {gather_list}")
     
 def example_scatter():
     """
@@ -171,17 +173,17 @@ def example_scatter():
         # scatter_list[0] = [1, 1, 1, 1, 1] → goes to rank 0
         # scatter_list[1] = [2, 2, 2, 2, 2] → goes to rank 1  
         # scatter_list[2] = [3, 3, 3, 3, 3] → goes to rank 2
-        print(f"Rank 0: Tensor to scatter: {scatter_list}")
+        logger.info(f"Rank 0: Tensor to scatter: {scatter_list}")
     else:
         scatter_list = None  # Non-source ranks don't have data to scatter
         
     # All ranks prepare container to receive their piece
     tensor = torch.zeros(5, dtype=torch.float32).cuda()
-    print(f"Before scatter on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"Before scatter on rank {dist.get_rank()}: {tensor}")
     
     # Each rank receives its designated tensor from scatter_list
     dist.scatter(tensor, scatter_list, src=0)
-    print(f"After scatter on rank {dist.get_rank()}: {tensor}")
+    logger.info(f"After scatter on rank {dist.get_rank()}: {tensor}")
 
 def example_reduce_scatter():
     """
@@ -216,9 +218,9 @@ def example_reduce_scatter():
         for j in range(world_size)
         ]
     output_tensor = torch.zeros(world_size, dtype=torch.float32).cuda()
-    print(f"Before ReduceScatter on rank {rank}: {input_tensor}")
+    logger.info(f"Before ReduceScatter on rank {rank}: {input_tensor}")
     dist.reduce_scatter(output_tensor, input_tensor, op=dist.ReduceOp.SUM)
-    print(f"After ReduceScatter on rank {rank}: {output_tensor}")    
+    logger.info(f"After ReduceScatter on rank {rank}: {output_tensor}")    
 
 
 def example_all_reduce_decomposition():
@@ -242,7 +244,7 @@ def example_all_reduce_decomposition():
         (rank + 1) * 3   # position 2: 3, 30, 300
     ], dtype=torch.float32).cuda()
     
-    print(f"INITIAL STATE - GPU {rank}: {tensor}")
+    logger.info(f"INITIAL STATE - GPU {rank}: {tensor}")
     
     # ============================================================================
     # STEP 1: REDUCE_SCATTER 
@@ -253,15 +255,15 @@ def example_all_reduce_decomposition():
     input_list = [tensor.clone() for _ in range(world_size)]
     output_chunk = torch.zeros(1, dtype=torch.float32).cuda()  # Single element output
     
-    print(f"REDUCE_SCATTER INPUT - GPU {rank}: {input_list}")
+    logger.info(f"REDUCE_SCATTER INPUT - GPU {rank}: {input_list}")
     
     # Reduce-scatter: sum across all GPUs, each gets one chunk
     dist.reduce_scatter(output_chunk, input_list, op=dist.ReduceOp.SUM)
     
-    print(f"AFTER REDUCE_SCATTER - GPU {rank}: {output_chunk}")
-    print(f"  → GPU 0 has: sum of position 0 = 1+10+100 = {111 if rank == 0 else '...'}")
-    print(f"  → GPU 1 has: sum of position 1 = 2+20+200 = {222 if rank == 1 else '...'}")  
-    print(f"  → GPU 2 has: sum of position 2 = 3+30+300 = {333 if rank == 2 else '...'}")
+    logger.info(f"AFTER REDUCE_SCATTER - GPU {rank}: {output_chunk}")
+    logger.info(f"  → GPU 0 has: sum of position 0 = 1+10+100 = {111 if rank == 0 else '...'}")
+    logger.info(f"  → GPU 1 has: sum of position 1 = 2+20+200 = {222 if rank == 1 else '...'}")  
+    logger.info(f"  → GPU 2 has: sum of position 2 = 3+30+300 = {333 if rank == 2 else '...'}")
     
     # ============================================================================
     # STEP 2: ALL_GATHER
@@ -277,8 +279,8 @@ def example_all_reduce_decomposition():
     # Reconstruct the complete result
     final_result = torch.cat(gather_list)
     
-    print(f"AFTER ALL_GATHER - GPU {rank}: {final_result}")
-    print(f"  → All GPUs now have: [111, 222, 333] (complete summed result)")
+    logger.info(f"AFTER ALL_GATHER - GPU {rank}: {final_result}")
+    logger.info(f"  → All GPUs now have: [111, 222, 333] (complete summed result)")
     
     # ============================================================================
     # VERIFICATION: Compare with direct all_reduce
@@ -292,34 +294,34 @@ def example_all_reduce_decomposition():
     # Direct all_reduce for comparison
     dist.all_reduce(verification_tensor, op=dist.ReduceOp.SUM)
     
-    print(f"DIRECT ALL_REDUCE - GPU {rank}: {verification_tensor}")
-    print(f"  → Should match all_gather result: {torch.equal(final_result, verification_tensor)}")
+    logger.info(f"DIRECT ALL_REDUCE - GPU {rank}: {verification_tensor}")
+    logger.info(f"  → Should match all_gather result: {torch.equal(final_result, verification_tensor)}")
     
     # ============================================================================
     # SUMMARY OF TENSOR STATES
     # ============================================================================
     if rank == 0:
-        print("\n" + "="*80)
-        print("TENSOR STATE SUMMARY:")
-        print("="*80)
-        print("INITIAL:")
-        print("  GPU 0: [1, 2, 3]")
-        print("  GPU 1: [10, 20, 30]") 
-        print("  GPU 2: [100, 200, 300]")
-        print()
-        print("AFTER REDUCE_SCATTER:")
-        print("  GPU 0: [111]     ← sum of position 0 from all GPUs")
-        print("  GPU 1: [222]     ← sum of position 1 from all GPUs")
-        print("  GPU 2: [333]     ← sum of position 2 from all GPUs")
-        print()
-        print("AFTER ALL_GATHER:")
-        print("  GPU 0: [111, 222, 333]  ← complete result")
-        print("  GPU 1: [111, 222, 333]  ← complete result") 
-        print("  GPU 2: [111, 222, 333]  ← complete result")
-        print()
-        print("This is EXACTLY what all_reduce produces!")
-        print("Ring AllReduce = reduce_scatter + all_gather")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("TENSOR STATE SUMMARY:")
+        logger.info("="*80)
+        logger.info("INITIAL:")
+        logger.info("  GPU 0: [1, 2, 3]")
+        logger.info("  GPU 1: [10, 20, 30]") 
+        logger.info("  GPU 2: [100, 200, 300]")
+        logger.info()
+        logger.info("AFTER REDUCE_SCATTER:")
+        logger.info("  GPU 0: [111]     ← sum of position 0 from all GPUs")
+        logger.info("  GPU 1: [222]     ← sum of position 1 from all GPUs")
+        logger.info("  GPU 2: [333]     ← sum of position 2 from all GPUs")
+        logger.info()
+        logger.info("AFTER ALL_GATHER:")
+        logger.info("  GPU 0: [111, 222, 333]  ← complete result")
+        logger.info("  GPU 1: [111, 222, 333]  ← complete result") 
+        logger.info("  GPU 2: [111, 222, 333]  ← complete result")
+        logger.info()
+        logger.info("This is EXACTLY what all_reduce produces!")
+        logger.info("Ring AllReduce = reduce_scatter + all_gather")
+        logger.info("="*80)
     """
     REDUCE_SCATTER: Combines reduction + scatter in one operation
     
@@ -362,14 +364,14 @@ def example_all_reduce_decomposition():
     #      to rank 0      to rank 1      to rank 2
     
     output_tensor = torch.zeros(2, dtype=torch.float32).cuda()
-    print(f"Before ReduceScatter on rank {rank}: {input_tensor}")
+    logger.info(f"Before ReduceScatter on rank {rank}: {input_tensor}")
     
     # After reduce_scatter:
     # rank 0 gets: sum of position 0 tensors = [1,2] + [2,4] + [3,6] = [6,12]
     # rank 1 gets: sum of position 1 tensors = [1,4] + [4,16] + [9,36] = [14,56]
     # rank 2 gets: sum of position 2 tensors = [1,8] + [8,64] + [27,216] = [36,288]
     dist.reduce_scatter(output_tensor, input_tensor, op=dist.ReduceOp.SUM)
-    print(f"After ReduceScatter on rank {rank}: {output_tensor}")    
+    logger.info(f"After ReduceScatter on rank {rank}: {output_tensor}")    
 
 
 def example_all_to_all():
@@ -384,7 +386,7 @@ def example_all_to_all():
     else:
         data = torch.tensor([5, 6, 7, 8])  # Rank 1's data
     
-    print(f"Rank {rank} initial data: {data}")
+    logger.info(f"Rank {rank} initial data: {data}")
     
     # All-to-All: each rank sends half its data to each rank
     # Split data into chunks (one per rank)
@@ -398,7 +400,7 @@ def example_all_to_all():
     
     # Combine received chunks
     result = torch.cat(recv_chunks)
-    print(f"Rank {rank} after all-to-all: {result}")
+    logger.info(f"Rank {rank} after all-to-all: {result}")
     
     dist.destroy_process_group()
 
@@ -412,25 +414,26 @@ def example_all_to_all():
 # - Establishes communication backend (NCCL for GPU)
 # - Enables collective operations
 dist.init_process_group()
+init_logger()
 
-print("**reduce**")
+logger.info("**reduce**")
 example_reduce()
-print("**all-reduce**")
+logger.info("**all-reduce**")
 example_all_reduce()
 dist.barrier()  # Synchronization point - wait for all processes
-print("***gather**")
+logger.info("***gather**")
 example_gather()
 dist.barrier()
-print("**all-gather**")
+logger.info("**all-gather**")
 example_all_gather()
 dist.barrier()
-print("***scatter**")
+logger.info("***scatter**")
 example_scatter()
 dist.barrier()
-print("***reduce-scatter**")
+logger.info("***reduce-scatter**")
 example_reduce_scatter()
 dist.barrier()
-print("***all-to-all**")
+logger.info("***all-to-all**")
 example_all_to_all()
 
 # ============================================================================

@@ -220,7 +220,16 @@ class Attention(nn.Module):
         # we use casual mask for training
         #logger.info(f"xq shape: {xq.shape}, xk shape: {xk.shape}, xv shape: {xv.shape}")
         #logger.info(f"xq type: {xq.type()}, xk type: {xk.type()}, xv type: {xv.type()}")
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+        # Force Flash Attention if available
+        with torch.nn.attention.sdpa_kernel(
+            backends=[
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                # Fallback to efficient if flash not available
+                #torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
+            ],
+            set_priority=True,
+        ):
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
