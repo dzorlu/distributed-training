@@ -358,6 +358,17 @@ def main(args):
         with ctx:
             logits = model(x)
             _loss = loss_fn(logits, y)
+
+            # Collect auxiliary losses from all MoE layers
+            if args.use_moe:
+                aux_losses = []
+                for layer in model.layers:
+                    if hasattr(layer.feed_forward, 'aux_loss') and layer.feed_forward.aux_loss is not None:
+                        aux_losses.append(layer.feed_forward.aux_loss)
+                aux_losses = torch.stack(aux_losses).sum()
+                _loss += aux_losses
+
+            
             del logits  # avoid peaking memory at the start of the backward pass.
             _loss.backward()
             return _loss

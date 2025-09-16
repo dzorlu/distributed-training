@@ -28,6 +28,7 @@ class ModelArgs:
     top_k: int = 2
     use_moe: bool = True
     score_func: str = "sigmoid"
+    aux_loss_coeff: float = 0.01
 
     # lr
     lr: float = 0.00005

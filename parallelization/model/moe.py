@@ -55,11 +55,26 @@ class Router(nn.Module):
         self.update_rate = 0.01
         self.beta = 0.9
         self.score_func = model_args.score_func
+        self.aux_loss_coeff = model_args.aux_loss_coeff
+        self.aux_loss = None
 
         # === LOSS-FREE BALANCING: Expert bias initialization ===
         # Register as buffer (persists but not optimized)
         self.register_buffer('expert_bias', torch.zeros(model_args.num_experts))
-        
+
+    def compute_aux_loss(self, 
+        expert_scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        ) -> torch.Tensor:
+        T, K = expert_scores.shape[0], expert_scores.shape[1]
+
+        p_i = expert_scores.mean(axis=0)
+        f_i = num_tokens_per_expert / (T * K)
+
+        aux_loss = (p_i * f_i).sum() * self.aux_loss_coeff
+        return aux_loss
+
+
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -127,6 +142,8 @@ class Router(nn.Module):
             selected_experts_indices.view(-1),
             minlength=self.model_args.num_experts
         )
+
+        self.aux_loss = self.aux_loss = self.compute_aux_loss(top_scores, num_tokens_per_expert)
 
         with torch.no_grad():
             counts = num_tokens_per_expert.float()
