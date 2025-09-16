@@ -226,8 +226,8 @@ class GroupedExpert(nn.Module):
             num_tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert.
         """
 
-        col_group_rank = dist.get_rank(self.device_mesh.get_group("cols"))
-        row_group_rank = dist.get_rank(self.device_mesh.get_group("rows"))
+        col_group_rank = dist.get_rank(self.device_mesh.get_group("ep"))
+        row_group_rank = dist.get_rank(self.device_mesh.get_group("dp"))
         logger.info(f"{col_group_rank=} {row_group_rank=}")
         
         # Create a CPU copy for logging and operations that require it

@@ -225,7 +225,7 @@ class Attention(nn.Module):
             backends=[
                 torch.nn.attention.SDPBackend.FLASH_ATTENTION,
                 # Fallback to efficient if flash not available
-                #torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
             ],
             set_priority=True,
         ):

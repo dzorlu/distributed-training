@@ -5,7 +5,7 @@ from torch.distributed.device_mesh import DeviceMesh
 @dataclass
 class ModelArgs:
     dim: int = 1024 #2048
-    n_layers: int = 16 #64
+    n_layers: int = 8 #64
     n_heads: int = 16
     n_kv_heads: Optional[int] = None
     vocab_size: int = 1000  # defined later by tokenizer

@@ -164,7 +164,7 @@ class ExpertParallel(ParallelStyle):
             All-to-all communication
             input_splits is different coming from each device (assuming some data parallelism)
         """
-        ep_group = device_mesh.get_group("cols")
+        ep_group = device_mesh.get_group("ep")
         ep_size = ep_group.size()
         #logger.info(f"{describe_group(ep_group)=} {ep_size=}")
 
@@ -310,7 +310,7 @@ class ExpertParallel(ParallelStyle):
             Reverse the _token_dispatch operation.
             All-to-all to combine the output
         """
-        ep_group = device_mesh.get_group("cols")
+        ep_group = device_mesh.get_group("ep")
         ep_size = ep_group.size()
         #logger.info(f"{describe_group(ep_group)=} {ep_size=}")
 

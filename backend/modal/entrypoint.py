@@ -12,13 +12,27 @@ from pathlib import Path
 APP_NAME = "distributed-training"
 app = modal.App(APP_NAME)
 
-# Read config.yaml colocated with this file
+# Read config.yaml from known locations
 _HERE = Path(__file__).resolve().parent
-_CONFIG_PATH = _HERE / "config.yaml"
-if not _CONFIG_PATH.exists():
-    raise FileNotFoundError(f"Missing Modal config at {_CONFIG_PATH}. Create with 'gpu: H100:8'")
-with _CONFIG_PATH.open("r") as f:
-    _cfg = yaml.safe_load(f) or {}
+_CANDIDATE_PATHS = [
+    _HERE / "config.yaml",
+    Path("/workspace/code/backend/modal/config.yaml"),
+]
+_ENV_PATH = os.environ.get("MODAL_CONFIG_PATH")
+if _ENV_PATH:
+    _CANDIDATE_PATHS.insert(0, Path(_ENV_PATH))
+
+_cfg: dict = {}
+for _p in _CANDIDATE_PATHS:
+    if _p.exists():
+        with _p.open("r") as f:
+            _cfg = yaml.safe_load(f) or {}
+        break
+if not _cfg:
+    raise FileNotFoundError(
+        f"Missing Modal config. Checked: {', '.join(str(p) for p in _CANDIDATE_PATHS)}."
+    )
+
 GPU_SPEC = _cfg.get("gpu")
 if not GPU_SPEC or not isinstance(GPU_SPEC, str):
     raise ValueError("Modal config must contain 'gpu: <TYPE:COUNT>'")
@@ -38,7 +52,6 @@ image = (
         "datasets",
         "huggingface-hub",
         "wandb",
-        "git+https://github.com/fanshiqing/grouped_gemm@main",
     )
     .env(
         {
@@ -51,7 +64,8 @@ image = (
     # Local code mount (adjust path if your repo root differs)
 # Use a path relative to this file to avoid hardcoded absolute paths
 _REPO_ROOT = (_HERE / ".." / "..").resolve()
-CODE_MOUNT = modal.Mount.from_local_dir(str(_REPO_ROOT), remote_path="/workspace/code")
+# Bake the local repo into the image at build time (reproducible submission)
+image = image.add_local_dir(str(_REPO_ROOT), "/workspace/code")
 
     # Optional: declare secret names you have configured in Modal
 def _try_secret(name: str):
@@ -60,15 +74,14 @@ def _try_secret(name: str):
     except Exception:
         return None
 
+
 SECRETS = list(filter(None, [_try_secret(n) for n in SECRET_NAMES]))
 
 @app.function(
-    name="run_torchrun",
     gpu=GPU_SPEC,
     image=image,
-    mounts=[CODE_MOUNT],
     secrets=SECRETS if SECRETS else None,
-    timeout=0,
+    timeout=86400,
 )
 def run_torchrun(args_json: str):  # type: ignore
     os.environ["RUNNING_UNDER_MODAL"] = "1"
@@ -76,6 +89,22 @@ def run_torchrun(args_json: str):  # type: ignore
 
     args = json.loads(args_json)
     script_argv: List[str] = args.get("argv", [])
+
+    # Install GPU-dependent extension at runtime (GPU available now)
+    try:
+        subprocess.run(
+            [
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "--no-build-isolation",
+                "git+https://github.com/fanshiqing/grouped_gemm@main",
+            ],
+            check=True,
+        )
+    except Exception:
+        pass
 
     # Prefer calling the file path to avoid Python -m import path issues
     cmd = [
