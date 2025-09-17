@@ -27,6 +27,10 @@ def get_hf_dataloader(
         split=dataset_split
     )
 
+    if "wikitext" in dataset_name:
+        # Filter out empty lines and very short texts
+        dataset = dataset.filter(lambda x: len(x["text"].strip()) > 20)
+
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -61,19 +65,17 @@ def get_hf_dataloader(
             texts = []
             for messages_pair in examples["messages"]:
                 # messages_pair is [user_dict, assistant_dict]
-                if len(messages_pair) == 2:
-                    user_msg = messages_pair[0]
-                    assistant_msg = messages_pair[1]
-                    
-                    # Extract content from each message dict
-                    user_content = user_msg.get("content", "") if isinstance(user_msg, dict) else str(user_msg)
-                    assistant_content = assistant_msg.get("content", "") if isinstance(assistant_msg, dict) else str(assistant_msg)
-                    
-                    # Format as conversation
-                    full_text = f"User: {user_content}\n\nAssistant: {assistant_content}"
-                    texts.append(full_text)
-                else:
-                    texts.append("")
+                
+                user_msg = messages_pair[0]
+                assistant_msg = messages_pair[1]
+                
+                # Extract content from each message dict
+                user_content = user_msg.get("content", "") if isinstance(user_msg, dict) else str(user_msg)
+                assistant_content = assistant_msg.get("content", "") if isinstance(assistant_msg, dict) else str(assistant_msg)
+                
+                # Format as conversation
+                full_text = f"User: {user_content}\n\nAssistant: {assistant_content}"
+                texts.append(full_text)
             
             tokenized = tokenizer(
                 texts,
@@ -81,6 +83,8 @@ def get_hf_dataloader(
                 padding="max_length",
                 max_length=seq_len,
             )
+            non_pad_count = sum(1 for tid in tokenized["input_ids"] if tid != tokenizer.pad_token_id)
+            logger.info(f"{non_pad_count=}, {len(tokenized['input_ids'])=}")
             
             labels = [l[1:] + [tokenizer.pad_token_id] for l in tokenized["input_ids"]]
             

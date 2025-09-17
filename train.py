@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import re
+import time
 import importlib
 from typing import List
 import wandb
@@ -217,7 +218,10 @@ def main(args):
     rank = device_mesh.get_rank()
     if args.wandb:
         if rank == 0:
-            wandb.init(project="distributed-training")
+            wandb.init(project=args.dataset_name)
+            wandb.define_metric("prof/step", hidden=True)
+            wandb.define_metric("prof/*", step_metric="prof/step")
+
 
     # Use len(tokenizer) to get the actual vocabulary size including all special tokens
     actual_vocab_size = len(tokenizer)
@@ -324,6 +328,7 @@ def main(args):
 
     # foreach=False is not optimized.
     optimizer = Adam(model.parameters(), lr=model_args.lr)
+    global_step = 0
 
     monitor = performance_monitor(
         model,
@@ -346,7 +351,7 @@ def main(args):
     )
 
     @monitor
-    def training_step(x, y):
+    def training_step(x, y, i):
         ctx = nullcontext()
         if args.use_cp:
             ctx = context_parallel(
@@ -357,15 +362,18 @@ def main(args):
             )
         with ctx:
             logits = model(x)
+            if torch.isnan(logits).any():
+                logger.warning(f"NaN in logits")
             _loss = loss_fn(logits, y)
 
             # Collect auxiliary losses from all MoE layers
             if args.use_moe:
                 aux_losses = []
                 for layer in model.layers:
-                    if hasattr(layer.feed_forward, 'aux_loss') and layer.feed_forward.aux_loss is not None:
-                        aux_losses.append(layer.feed_forward.aux_loss)
+                    if hasattr(layer.feed_forward.router, 'aux_loss') and layer.feed_forward.router.aux_loss is not None:
+                        aux_losses.append(layer.feed_forward.router.aux_loss)
                 aux_losses = torch.stack(aux_losses).sum()
+                logger.info(f"{i=}, {aux_losses=}, {_loss=}")
                 _loss += aux_losses
 
             
@@ -388,11 +396,14 @@ def main(args):
     optimizer.zero_grad(set_to_none=True)
     accumulated_losses: List[torch.Tensor] = []
     accumulated_n_tokens_seen = 0
+    lapsed_in_sec = 0
     for i, batch in enumerate(dataloader, 1):
+        t = time.time()
         x = batch['input_ids'].to(device, non_blocking=True)
         #logger.info(f"{x.shape=}")
         y = batch['labels'].to(device, non_blocking=True)
-        loss = training_step(x, y)
+        loss = training_step(x, y, i)
+        lapsed_in_sec +=  time.time() - t 
 
         accumulated_losses.append(loss.detach())
         accumulated_n_tokens_seen += y.numel()
@@ -406,19 +417,30 @@ def main(args):
             reduceOp = c10d.ReduceOp.SUM.name
             log_n_tokens_seen = funcol.all_reduce(log_n_tokens_seen, reduceOp=reduceOp, group=dp_mesh)
 
+            # secs per step
+            lapsed_in_sec = torch.tensor(lapsed_in_sec, device=device, dtype=torch.long)
+            reduceOp = c10d.ReduceOp.AVG.name
+            lapsed_in_sec = funcol.all_reduce(lapsed_in_sec, reduceOp=reduceOp, group=dp_mesh)
+
         
             # Sum of scaled losses equals mean loss over the accumulation window
             log_loss = torch.sum(torch.stack(accumulated_losses))
             reduceOp = c10d.ReduceOp.AVG.name
             log_loss = funcol.all_reduce(log_loss, reduceOp=reduceOp, group=dp_mesh)
+
             if args.wandb and rank == 0:
                 wandb.log(
                     {
                         "loss": log_loss.item(),
                         "n_tokens_seen": log_n_tokens_seen.item(),
-                    }
+                        "sec_per_step": lapsed_in_sec,
+                    },
+                    step=global_step, 
+                    commit=True
                 )
+                global_step += 1
             accumulated_losses = []
+            lapsed_in_sec = 0
 
     # Flush leftover microbatches if the last window is incomplete
     if accumulated_losses:
@@ -428,10 +450,17 @@ def main(args):
         reduceOp = c10d.ReduceOp.AVG.name
         log_loss = funcol.all_reduce(log_loss, reduceOp=reduceOp, group=dp_mesh)
         if args.wandb and rank == 0:
-            wandb.log({"loss": log_loss.item()})
+            wandb.log(
+                {
 
-    if args.wandb and rank == 0:
-        wandb.finish()
+                    "loss": log_loss.item(),
+                    "n_tokens_seen": log_n_tokens_seen.item(),
+                },
+                step=global_step,
+                commit=True,
+            )
+            global_step += 1
+
     torch.distributed.destroy_process_group()
 
 

@@ -52,11 +52,11 @@ class Router(nn.Module):
         self.model_args = model_args
         self.router = nn.Linear(model_args.dim, model_args.num_experts, bias=False)
         self.device_mesh = model_args.device_mesh
-        self.update_rate = 0.01
-        self.beta = 0.9
+        self.beta = 0.6
         self.score_func = model_args.score_func
         self.aux_loss_coeff = model_args.aux_loss_coeff
         self.aux_loss = None
+        self.register_buffer('step', torch.tensor(0))
 
         # === LOSS-FREE BALANCING: Expert bias initialization ===
         # Register as buffer (persists but not optimized)
@@ -66,13 +66,14 @@ class Router(nn.Module):
         expert_scores: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         ) -> torch.Tensor:
-        T, K = expert_scores.shape[0], expert_scores.shape[1]
+        T, K = expert_scores.shape[0], self.model_args.top_k
 
         p_i = expert_scores.mean(axis=0)
         f_i = num_tokens_per_expert / (T * K)
-
+        logger.info(f"{p_i=} {f_i=}")
         aux_loss = (p_i * f_i).sum() * self.aux_loss_coeff
-        return aux_loss
+        logger.info(f"{aux_loss=}")
+        self.aux_loss = aux_loss
 
 
 
@@ -108,6 +109,9 @@ class Router(nn.Module):
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         # expert score are normalized such that bias can have a real impact on the routing decision
+        # Softmax should be used because sigmoid produces nearly uniform scores (~0.5) across all experts, 
+        # making the auxiliary loss insensitive to actual routing imbalance, 
+        # while softmax creates meaningful probability variations that properly penalize skewed expert selection.
         if self.score_func == "sigmoid":
             expert_scores = torch.sigmoid(expert_scores.to(torch.float32))
         elif self.score_func == "softmax":
@@ -115,11 +119,20 @@ class Router(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
-        
+        # add noise to the scores to avoid the expert bias from dominating the routing decision
+        # initial exploration is important
+        self.step += 1
+        logger.info(f"{self.step=}")
+        noise_scale = (
+            self.model_args.moe_noise_scale
+            * (1 - self.step.float() / self.model_args.moe_warmup_steps)
+        ).clamp(min=0.0)
+        if noise_scale > 0:
+            logger.info(f"{noise_scale=}")
+            expert_scores = expert_scores + torch.randn_like(expert_scores) * noise_scale
         # === LOSS-FREE BALANCING: Apply expert bias ===
         # Add bias to scores BEFORE top-K selection
         # This steers tokens away from overloaded experts
-        logger.info(f"{expert_scores.mean(axis=0)=}")
         biased_scores = expert_scores + self.expert_bias.to(expert_scores.dtype).unsqueeze(0)
         
         # [b*s, num_experts], [b*s, num_experts]
@@ -131,8 +144,8 @@ class Router(nn.Module):
         #  not influenced by the bias terms
         top_scores = torch.gather(expert_scores, -1, selected_experts_indices)
         # need to normalize for sigmoid so that the sum of the top_scores is 1
-        if self.score_func == "sigmoid":
-            top_scores = top_scores / top_scores.sum(dim=-1, keepdim=True)  
+        # this is used for the weighted sum of the expert outputs
+        top_scores = top_scores / top_scores.sum(dim=-1, keepdim=True)  
 
         
         # histogram!
@@ -142,8 +155,9 @@ class Router(nn.Module):
             selected_experts_indices.view(-1),
             minlength=self.model_args.num_experts
         )
+        logger.info(f"{num_tokens_per_expert=}")
 
-        self.aux_loss = self.aux_loss = self.compute_aux_loss(top_scores, num_tokens_per_expert)
+        self.compute_aux_loss(expert_scores, num_tokens_per_expert)
 
         with torch.no_grad():
             counts = num_tokens_per_expert.float()
@@ -161,8 +175,8 @@ class Router(nn.Module):
             dist.all_reduce(self.expert_bias, op=dist.ReduceOp.SUM, group=g)
             self.expert_bias.div_(dist.get_world_size(g))
 
-            # keep centered and bounded
-            self.expert_bias.sub_(self.expert_bias.mean())
+            # keep bounded
+            self.expert_bias.clamp_(-0.5, 0.5)
             logger.info(f"{self.expert_bias=}")
 
 
@@ -196,7 +210,7 @@ class Router(nn.Module):
     def init_weights(self, init_std: float):
         with torch.random.fork_rng():
             torch.manual_seed(42)  # Same seed on all ranks
-            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std * 0.01)
+            nn.init.trunc_normal_(self.router.weight, mean=0.0, std=init_std)
 
 
 
@@ -257,7 +271,7 @@ class GroupedExpert(nn.Module):
             for i, count in enumerate(num_tokens_per_expert_cpu):
                 i = i + col_group_rank * len(num_tokens_per_expert_cpu)
                 token_dist = {f"expert_{row_group_rank}_{i}": count.item()}
-                wandb.log({"token_distribution": token_dist})
+                wandb.log({"token_distribution": token_dist}, commit=False)
 
         # --- Fused GMM Kernel ---
         # The rest of the forward pass remains the same...

@@ -145,11 +145,12 @@ class performance_monitor:
             tflops = total_flops / t_lapsed / 1e12 if t_lapsed > 0 else 0
             logger.info(f"rank {self.rank} step {self.step_num} total_flops: {total_flops:,} tflops: {tflops:.2f}")
             if wandb.run is not None:
+                # flop counter
                 wandb.log({
-                    f"tflops_rank_{self.rank}": tflops,
-                    f"total_flops_rank_{self.rank}": total_flops,
-                    "step": self.step_num
-                })
+                    "prof/step": self.step_num,
+                    f"prof/tflops_rank_{self.rank}": tflops,
+                    f"prof/total_flops_rank_{self.rank}": total_flops,
+                }, commit=False)   # or step=global_step if you prefer to align, but keep commit=False
         return result
 
     def _run_comm_logger(self):
@@ -177,28 +178,23 @@ class performance_monitor:
 
 
 def trace_handler(prof):
-    # Get rank for distributed setups
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    
-    # Only rank 0 prints summary to avoid spam
+    rank = int(os.environ.get("RANK", 0))  # use global rank
     if rank == 0:
         logger.info("\n📈 Profiling Summary:")
         output = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
         logger.info(output)
+
         if wandb.run is not None:
-            # Log top 10 events by cuda_time_total to W&B
-            profile_metrics = {}
+            profile_metrics = {"prof/step": int(prof.step_num)}
             for event in prof.key_averages(group_by_input_shape=True)[:10]:
-                metric_name = event.key.replace(" ", "_").replace("=", "").replace(",", "")
-                # Safely access attributes that may not be present (e.g., cuda_time_total on CPU-only events)
-                cuda_time_ms = getattr(event, 'cuda_time_total', 0) / 1000
-                cpu_time_ms = getattr(event, 'cpu_time_total', 0) / 1000
-                if cuda_time_ms > 0:
-                    profile_metrics[f"prof/{metric_name}/cuda_time_total_ms"] = cuda_time_ms
-                if cpu_time_ms > 0:
-                    profile_metrics[f"prof/{metric_name}/cpu_time_total_ms"] = cpu_time_ms
-            
-            wandb.log(profile_metrics)
+                metric = event.key.replace(" ", "_").replace("=", "").replace(",", "")
+                cuda_ms = getattr(event, "cuda_time_total", 0) / 1000
+                cpu_ms  = getattr(event, "cpu_time_total", 0) / 1000
+                if cuda_ms > 0:
+                    profile_metrics[f"prof/{metric}/cuda_time_total_ms"] = cuda_ms
+                if cpu_ms > 0:
+                    profile_metrics[f"prof/{metric}/cpu_time_total_ms"] = cpu_ms
+            wandb.log(profile_metrics, commit=False)
         else:
             logger.warning("Wandb is not initialized")
     
