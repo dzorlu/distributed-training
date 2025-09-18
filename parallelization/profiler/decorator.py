@@ -51,6 +51,9 @@ class performance_monitor:
         nsight_output="nsight_profile",
         flop_counter_step=None,
         comm_logger_step=None,
+        upload_enabled=True,
+        gcp_bucket=None,
+        run_id=None,
     ):
         self.model = model
         self.comm_mode = comm_mode
@@ -72,6 +75,14 @@ class performance_monitor:
         self.prof = None
         self.step_num = 0
         self.rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        # Setup uploader if enabled
+        self.uploader = None
+        if upload_enabled and gcp_bucket:
+            from .upload_manager import TraceUploader
+            self.uploader = TraceUploader(gcp_bucket, run_id)
+            trace_handler.uploader = self.uploader
+            logger.info(f"📤 Trace upload enabled to {self.uploader.upload_path}")
 
     def _setup_profiler(self):
         os.makedirs(self.output_dir, exist_ok=True)
@@ -207,6 +218,10 @@ def trace_handler(prof):
     snap_path = f"/tmp/memory_snapshot_rank{rank}_step{prof.step_num}.pkl"
     _cm._dump_snapshot(snap_path)
     logger.info(f"💾 Memory timeline (Allocated vs Reserved) saved to: {snap_path}")
+    
+    # Queue for async upload
+    if hasattr(trace_handler, 'uploader'):
+        trace_handler.uploader.queue_upload(trace_path, snap_path, prof.step_num, rank)
 
     # # Compute total FLOPs
     total_flops = sum(evt.flops for evt in prof.key_averages() if hasattr(evt, "flops"))

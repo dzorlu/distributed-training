@@ -45,13 +45,14 @@ if not isinstance(SECRET_NAMES, list):
     # Base image and environment mirroring non-Ray portions of skypilot_small.yaml
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.8.0-cuda12.6-cudnn9-devel")
-    .apt_install(["git", "tmux", "htop", "iperf3", "netcat-openbsd"])
+    .apt_install(["git", "tmux", "htop", "iperf3", "netcat-openbsd", "curl"])
     .pip_install(
         "tabulate",
         "transformers",
         "datasets",
         "huggingface-hub",
         "wandb",
+        "google-cloud-storage",
     )
     .env(
         {
@@ -86,6 +87,22 @@ SECRETS = list(filter(None, [_try_secret(n) for n in SECRET_NAMES]))
 def run_torchrun(args_json: str):  # type: ignore
     os.environ["RUNNING_UNDER_MODAL"] = "1"
     os.chdir("/workspace/code")
+    
+    # Set up Google Cloud authentication from Modal secret
+    try:
+        # Get GCP credentials from Modal secret
+        gcp_creds = os.environ.get("GCP_CREDENTIALS")
+        if gcp_creds:
+            # Write credentials to file for google-cloud-storage client
+            creds_path = "/tmp/gcp_credentials.json"
+            with open(creds_path, "w") as f:
+                f.write(gcp_creds)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+            print(f"✅ GCP credentials set up at {creds_path}")
+        else:
+            print("⚠️ No GCP credentials found in environment")
+    except Exception as e:
+        print(f"Warning: Could not set up GCP credentials: {e}")
 
     args = json.loads(args_json)
     script_argv: List[str] = args.get("argv", [])

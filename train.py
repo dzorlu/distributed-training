@@ -205,8 +205,8 @@ def main(args):
         # FSDP
         device_mesh = init_device_mesh(
             "cuda",
-            (args.dp_size, args.cp_size),
-            mesh_dim_names=("dp_shard")
+            (args.dp_size,),
+            mesh_dim_names=("dp_shard",)
         )
         row_mesh  = device_mesh["dp_shard"]
         dp_mesh  = device_mesh["dp_shard"] 
@@ -218,7 +218,8 @@ def main(args):
     rank = device_mesh.get_rank()
     if args.wandb:
         if rank == 0:
-            wandb.init(project=args.dataset_name)
+            proj_name = args.dataset_name.split('/')[-1]
+            wandb.init(project=proj_name)
             wandb.define_metric("prof/step", hidden=True)
             wandb.define_metric("prof/*", step_metric="prof/step")
 
@@ -335,6 +336,7 @@ def main(args):
         enabled=args.profile,
         flop_counter_step=2,
         comm_logger_step=2,
+        gcp_bucket="distributed-train",
     )
 
 
@@ -382,7 +384,7 @@ def main(args):
             return _loss
 
     # --- Data Loading ---
-    logger.info(f"{args.dataset_name=}, {args.dataset_config_name=}, {args.dataset_split=}")
+    logger.info(f"{args.dataset_name=} {args.dataset_split=}")
     dataloader = get_hf_dataloader(
         dataset_name=args.dataset_name,
         dataset_config_name=args.dataset_config_name,
@@ -473,11 +475,12 @@ if __name__ == "__main__":
     parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size for MoE models")
     parser.add_argument("--cp-size", type=int, default=1, help="Conetext parallel size")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
+    parser.add_argument("--gpus-per-node", type=int, default=4, help="Number of GPUs per node")
     parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
     parser.add_argument("--dataset-name", type=str, default="wikitext", help="Hugging Face dataset name")
     #parser.add_argument("--dataset-name", type=str, default="zai-org/LongAlign-10k", help="Hugging Face dataset name")
     #parser.add_argument("--dataset-config-name", type=str, default="wikitext-2-v1", help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
-    #parser.add_argument("--dataset-config-name", type=str, help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
+    parser.add_argument("--dataset-config-name", type=str, help="Hugging Face dataset config name (e.g., 'en', 'wikitext-2-raw-v1')")
     parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split to use (e.g., 'train', 'train[:1%]')")
     
     # Profiler arguments
@@ -511,3 +514,6 @@ if __name__ == "__main__":
             torch.distributed.destroy_process_group()
             logger.info("Process group destroyed")
             wandb.finish()
+
+
+

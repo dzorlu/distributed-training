@@ -2,3 +2,4 @@ gpu: A100:4
 secrets:
   - WANDB_API_KEY
   - HUGGING_FACE_HUB_TOKEN
+  - GCP_CREDENTIALS
