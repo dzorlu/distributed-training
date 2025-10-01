@@ -419,13 +419,6 @@ class Transformer(nn.Module):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        with torch.device(self.freqs_cis.device):
-            self.freqs_cis = precompute_freqs_cis(
-                self.model_args.dim // self.model_args.n_heads,
-                # Need to compute until at least the max token limit for generation
-                # (use 2x max sequence length to be safe)
-                self.model_args.max_seq_len * 2,
-            )
         nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers:
             layer.init_weights()
