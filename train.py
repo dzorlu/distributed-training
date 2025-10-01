@@ -146,6 +146,9 @@ def main(args):
 
     if args.use_cp and args.use_moe:
         raise ValueError("CP and MoE are not supported together")
+    
+    if args.use_tp and (args.use_moe or args.use_cp):
+        raise ValueError("TP cannot be combined with MoE or CP")
 
     ########################
     # Mesh initialization  #
@@ -201,6 +204,25 @@ def main(args):
         row_mesh  = device_mesh["dp"]     # size = R*C = 8  -> used for FSDP
         col_mesh = device_mesh["cp"]   # size = C   = 2  -> used for CP
 
+    elif args.use_tp:
+        tp_size = args.tp_size
+        dp_shard = dp_size  # total DP sharding degree
+        
+        if world_size != dp_shard * tp_size:
+            raise ValueError(
+                f"World size ({world_size}) must equal dp_size ({dp_shard}) * tp_size ({tp_size})"
+            )
+        
+        device_mesh = init_device_mesh(
+            "cuda",
+            (dp_shard, tp_size),
+            mesh_dim_names=("dp_shard", "tp"),
+        )
+        
+        row_mesh = device_mesh["dp_shard"]   # for FSDP
+        dp_mesh = device_mesh["dp_shard"]    # for data loading
+        col_mesh = device_mesh["tp"]         # for TP
+
     else:
         # FSDP
         device_mesh = init_device_mesh(
@@ -209,7 +231,7 @@ def main(args):
             mesh_dim_names=("dp_shard",)
         )
         row_mesh  = device_mesh["dp_shard"]
-        dp_mesh  = device_mesh["dp_shard"] 
+        dp_mesh  = device_mesh["dp_shard"]
 
 
     logger.info(f"{device_mesh=}")
@@ -285,6 +307,24 @@ def main(args):
 
         # ----- 5) Wrap everything else on dp (8-way) -----
         fully_shard(model, mesh=row_mesh)
+    
+    elif args.use_tp:
+        apply_parallelization(
+            model=model,
+            model_name="tp",
+            mesh=col_mesh,
+            model_args=model_args,
+            rank=local_rank
+        )
+        
+        for layer_id, transformer_block in enumerate(model.layers):
+            fully_shard(
+                transformer_block,
+                mesh=row_mesh,
+            )
+        
+        fully_shard(model, mesh=row_mesh)
+    
     else:
         # ----- 1) FSDP
         for layer_id, transformer_block in enumerate(model.layers):
@@ -474,6 +514,8 @@ if __name__ == "__main__":
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size for MoE models")
     parser.add_argument("--cp-size", type=int, default=1, help="Conetext parallel size")
+    parser.add_argument("--use-tp", action="store_true", help="Whether to use Tensor Parallel")
+    parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
     parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed training")
     parser.add_argument("--gpus-per-node", type=int, default=4, help="Number of GPUs per node")
     parser.add_argument("--tokenizer-name", type=str, default="Qwen/Qwen-tokenizer", help="The name of the tokenizer to use")
