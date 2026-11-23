@@ -1,5 +1,29 @@
 # PyTorch Tensor Parallelism: Mental Models and Implementation
 
+## Distilled (2026-11-23)
+
+- **Why TP**: ZeRO shards params, grads and optimizer state, but activation memory still overtakes the memory budget.
+  TP splits the activations inside the block.
+- **Two types, a function of how you break the weight matrix**:
+  - Column-wise breaks the columns (out features). The output is split, so the full output would need an all-gather.
+  - Row-wise breaks the rows (in features). It needs the input split; outputs are partial sums, so it ends in an
+    all-reduce.
+- **Column-linear + row-linear go together**: the column-linear output is not all-gathered; it goes straight into the
+  row-linear as input, already split the way the row-linear needs (no communication). Then it gets summed with one
+  all-reduce.
+
+  ```python
+  a = x @ W1_shard     # column: [s, h] -> [s, 4h/tp]   no comm (x is full on every GPU)
+  y = a @ W2_shard     # row:    [s, 4h/tp] -> [s, h]   partial sum
+  y = all_reduce(y)    #                                one collective per block (forward)
+  ```
+- **Attention: split the heads.** Wq, Wk, Wv are column-wise, and the output dimension is laid out head by head, so
+  splitting the columns splits the heads. Every GPU has the full sequence, so no all-gather before attention; each GPU
+  runs its own heads. Wo is row-wise because its input arrives split by heads. The all-reduce gives the full hidden
+  vector that the residual add and norm need. `n_heads` (and `n_kv_heads` with GQA) must divide by tp.
+- **Sequence parallelism**: for the boundaries where we do token-wise operations like RMSNorm. The all-reduce becomes a
+  reduce-scatter (each GPU gets s/tp tokens with the full hidden dim), then an all-gather before the next column-linear.
+
 ## Core Mental Model: Ownership and Responsibility
 
 **Think about what each rank owns and when communication happens:**
