@@ -2,6 +2,8 @@
 
 ## Distilled (2026-11-23)
 
+- **All-reduce = reduce-scatter + all-gather.** Reduce-scatter is accumulation (each hop adds its own copy of the
+  chunk). All-gather is just copy. Each costs ~1P per GPU on a ring, so all-reduce is 2P.
 - **ZeRO-1**: you do forward and backward. This is fine because all params are on the GPU. Then for the optimizer
   step, each GPU only receives the gradients for the weights whose optimizer state sits on that GPU. Then it updates
   those weights. Then it shares the new params with all GPUs.
